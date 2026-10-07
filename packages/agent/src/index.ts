@@ -1,7 +1,59 @@
-// durable-agent — 用 pi-durable 复刻 raft daemon 的最小骨架
-//
-// TODO：把 "拉起一个 durable conversation、跑一个 agent turn、结果落盘"
-// 这条最小链路写在这里。先跑 examples/13-recovery.ts 理解 Harness/task/checkpoint，
-// 再对照 reference/raft-daemon/src/drivers/pi.ts 决定要包哪些能力。
-
-export {};
+export { DurableDaemon, type DurableDaemonOptions, type CreateAgentResult, type PostMessageOptions, type Answer } from "./daemon.ts";
+export { AgentOutbox, OutboxDoc, OutboxError, retransmitDelayMs, OUTBOX_NORMAL_CAP } from "./outbox.ts";
+export { AgentsDoc, AgentRegistryError } from "./agents.ts";
+export { projectLifecycle, type AgentLifecycleRecord } from "./lifecycle.ts";
+export { DurableEventNormalizer, extractPiUsageAttrs, buildPiTokenUsageEvent } from "./events.ts";
+export type {
+  AgentConfigInput,
+  AgentRuntimeOutcome,
+  AgentLifecycleKind,
+  AgentModelRef,
+  AgentRecord,
+  IncomingMessage,
+  OutboxDocEntry,
+  OutboxDocState,
+  OutboxFrame,
+  ParsedEvent,
+  TerminalFailureKind,
+} from "./types.ts";
+export {
+  initializeAgentWorkspace,
+  resolveWorkspaceDirectoryPath,
+  scanWorkspaceDirectories,
+  deleteWorkspaceDirectory,
+  DELIVERIES_DIR_NAME,
+  type WorkspaceDirectoryInfo,
+  type AgentWorkspaceSeedFile,
+} from "./workspaces.ts";
+export {
+  formatIncomingMessage,
+  formatConcreteMessagesRuntimeInput,
+  formatSystemNoticeRuntimeInput,
+  formatInboxUpdateRuntimeInput,
+  formatOperatorInput,
+  RESPONSE_TARGET_HINT,
+} from "./runtimeInput.ts";
+export {
+  createTurnOutcomeCounters,
+  noteTurnOutcomeEvent,
+  turnCompletedOutcome,
+  terminalFailureFromRawText,
+  type TurnOutcomeCounters,
+} from "./outcome.ts";
+export {
+  buildRuntimeErrorDiagnostic,
+  buildBoundedVisibleCrashDetail,
+  classifyRuntimeError,
+  fingerprintRuntimeError,
+  scrubRuntimeErrorDiagnosticText,
+  type RuntimeErrorClass,
+  type RuntimeErrorReason,
+} from "./diagnostics.ts";
+export { JsonlDeliveryTransport, ScriptedTransport, FlakyTransport, type OutboxTransport, type OutboxEnvelope } from "./transport.ts";
+export { RaftAgentExtension, RAFT_AGENT_EXTENSION_NAME } from "./extension.ts";
+export { MessagingExtension, SendMessageTool, SEND_MESSAGE_TOOL } from "./messaging.ts";
+export { RoutingTransport, MainInboxDoc, type AgentMessageFrame, type MainInboxEntry, type MainInboxState } from "./router.ts";
+export { ReminderService, RemindersDoc, parseWhen, type Reminder, type RemindersState } from "./reminders.ts";
+export { MachineLock, MachineLockError } from "./machineLock.ts";
+export { startServer, type ServeOptions } from "./serve.ts";
+export { appendToOutboxDoc } from "./outbox.ts";

@@ -2,5 +2,11 @@
   "name": "raftbuild-durable",
   "version": "0.0.0",
   "private": true,
-  "packageManager": "pnpm@10.20.0"
+  "packageManager": "pnpm@10.20.0",
+  "scripts": {
+    "typecheck": "pnpm -C packages/agent typecheck",
+    "e2e": "pnpm -C packages/agent e2e",
+    "cli": "pnpm -C packages/agent cli",
+    "raftd": "pnpm -C packages/agent raftd"
+  }
 }
