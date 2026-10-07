@@ -96,14 +96,20 @@ async function main(): Promise<number> {
 
   const stateDir = (flags.state as string) ?? process.env.RAFTD_STATE ?? ".raftd";
 
-  // If `raftd serve` is live (port file + reachable API), act as a thin client
-  // — opening the storage here would mean two Harnesses on one SQLite.
+  // If `raftd serve` was here (port file), act as a thin client — opening the
+  // storage anyway would mean two Harnesses on one SQLite. When the serve
+  // process is unreachable, refuse: silently opening a second Harness corrupts
+  // the live one's writes (verified: poisons the session mid-turn).
   if (cmd !== "serve") {
     const portFile = path.join(stateDir, "raftd.port");
     if (existsSync(portFile)) {
       const addr = (await readFile(portFile, "utf8")).trim();
       const code = await runRemote(`http://${addr}`, cmd, positional, flags).catch(() => null);
       if (code !== null) return code;
+      console.error(`error: a raftd serve was started on this state dir (port file ${portFile}) but is unreachable at http://${addr}.\n` +
+        "Refusing to open a second local Harness — SQLite is single-holder.\n" +
+        "Start `pnpm cli serve --state " + stateDir + "` again, or remove the stale raftd.port file only if no serve process is running.");
+      return 1;
     }
   }
 
@@ -120,6 +126,12 @@ async function main(): Promise<number> {
     compactOnWakeMs: compactIdleMs,
     onWarn: (m) => console.error(`[warn] ${m}`),
   });
+  if (daemon.providerCount === 0) {
+    console.error(
+      "warning: no model API keys detected (zhipu / ZAI_CODING_CN_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY).\n" +
+        "Agents will be created but every message lands as no_model terminal failure. Export a key and restart."
+    );
+  }
   const shutdown = async () => {
     await daemon.close();
   };
@@ -395,6 +407,11 @@ async function runRemote(
       return 0;
     }
     case "outbox": console.log(JSON.stringify(await call("GET", `agents/${encodeURIComponent(id)}/outbox`), null, 2)); return 0;
+    case "deliveries": {
+      const { deliveries }: any = await call("GET", `agents/${encodeURIComponent(id)}/deliveries?tail=200`);
+      for (const d of deliveries) console.log(JSON.stringify(d));
+      return 0;
+    }
     case "delete": await call("DELETE", `agents/${encodeURIComponent(id)}${flags.workspace === true ? "?workspace=true" : ""}`); console.log("deleted"); return 0;
     case "usage": console.log(JSON.stringify((await state()).usage, null, 2)); return 0;
     case "inspect": console.log(JSON.stringify(await call("GET", "inspect"), null, 2)); return 0;

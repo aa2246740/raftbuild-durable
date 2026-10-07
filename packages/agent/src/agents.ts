@@ -31,7 +31,7 @@ export const AgentBindingDoc = defineDoc<{ agentId: string }>({
 export class AgentRegistryError extends Error {
   constructor(
     message: string,
-    readonly code: "not_found" | "name_taken",
+    readonly code: "not_found" | "name_taken" | "invalid",
   ) {
     super(message);
     this.name = "AgentRegistryError";

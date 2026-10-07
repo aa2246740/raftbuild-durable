@@ -14,6 +14,8 @@
  *      of the oldest turn_completed, fail-closed → unreliable → human resolve.
  *   F  workspace containment (resolveWorkspaceDirectoryPath rules).
  *   G  runtime-input formatting (envelope + anti-forgery + reply hint).
+ *   L  hardening regressions: live reminders fire, stopped-target permanent
+ *      errors, corrupt-transcript tolerance, lock races, stale-port refusal.
  *
  * Run: pnpm e2e          (needs a real model key: zhipu or ZAI_CODING_CN_API_KEY)
  * Report: e2e/report.md
@@ -32,6 +34,8 @@ import {
   OutboxDoc,
   OutboxError,
   ReminderService,
+  AgentRegistryError,
+  parseWhen,
   ScriptedTransport,
   FlakyTransport,
   resolveWorkspaceDirectoryPath,
@@ -609,6 +613,28 @@ async function phaseJ(stateDir: string, alphaId: string) {
       text?: string;
     };
     check("HTTP round trip answered", answer.status === "done" && /READY/i.test(answer.text ?? ""), (answer.text ?? answer.status).slice(0, 80));
+
+    // API semantics: 409 on name collision, 400 on garbage.
+    const dup = await fetch("http://127.0.0.1:4888/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "gamma" }),
+    });
+    check("duplicate name → 409", dup.status === 409, `status=${dup.status}`);
+    const bad = await fetch("http://127.0.0.1:4888/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+    check("malformed JSON → 400", bad.status === 400, `status=${bad.status}`);
+    const badBusy = await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "hi", whenBusy: "bogus" }),
+    });
+    check("garbage whenBusy → 400", badBusy.status === 400, `status=${badBusy.status}`);
+    const gone = await fetch(`http://127.0.0.1:4888/api/agents/no-such-agent/lifecycle`);
+    check("unknown agent → 404", gone.status === 404, `status=${gone.status}`);
   } finally {
     serve.kill("SIGTERM");
     await Promise.race([new Promise((r) => serve.once("exit", r)), sleep(15_000)]);
@@ -653,6 +679,83 @@ async function phaseK(stateDir: string) {
   }
 }
 
+// ── L: hardening regressions (critic-driven fixes) ──────────────────────────
+
+async function phaseL(stateDir: string) {
+  phase("L — hardening regressions");
+
+  // Repeating reminders need >= 1s or the submit loop bricks the outbox.
+  try {
+    parseWhen("every 0s");
+    check("`every 0s` rejected", false, "no throw");
+  } catch {
+    check("`every 0s` rejected", true);
+  }
+
+  const daemon = await DurableDaemon.open({ stateDir, providers: "env", defaultModel: MODEL });
+  try {
+    const { record } = await daemon.createAgent({
+      name: "lambda",
+      model: MODEL,
+      instructions: "Reply with one short word.",
+    });
+
+    // Live-created reminder fires without a restart (was BLOCKER #1).
+    const service = new ReminderService(daemon);
+    await service.start();
+    await daemon.remind(record.agentId, "in 1s", "LIVE-FIRE-MARKER");
+    const fired = await waitFor(
+      "live reminder admitted",
+      async () => (await daemon.chatFeed(record.agentId)).some((i) => (i.text ?? "").includes("LIVE-FIRE-MARKER")),
+      20_000,
+      500,
+    );
+    check("live-created reminder fires", fired);
+    service.stop();
+
+    // Stopped target: postMessage throws a permanent error so routing bounces
+    // terminally instead of head-of-line wedging the sender's outbox.
+    await daemon.stopAgent(record.agentId);
+    let permanent = false;
+    try {
+      await daemon.postMessage(record.agentId, "hello", { raw: true });
+    } catch (err) {
+      permanent = err instanceof OutboxError || err instanceof AgentRegistryError;
+    }
+    check("postMessage to stopped agent is a permanent error", permanent);
+    await daemon.startAgent(record.agentId);
+
+    // A torn transcript line must not truncate the event stream.
+    const feedBefore = (await daemon.chatFeed(record.agentId)).length;
+    await writeFile(transcriptFile(stateDir, record.agentId), "{corrupt!!!\n", { flag: "a" });
+    let yielded = 0;
+    for await (const _e of daemon.events(record.agentId)) yielded++;
+    check("corrupt transcript line tolerated", yielded > 0, `events=${yielded}, feed=${feedBefore}`);
+
+    // Racing lock acquires: exactly one winner.
+    const first = await MachineLock.acquire(stateDir).catch(() => null);
+    check("first lock acquire succeeds", first !== null);
+    const second = await MachineLock.acquire(stateDir).then(
+      () => "won",
+      (err) => (err instanceof MachineLockError ? "refused" : `unexpected ${err}`),
+    );
+    check("second live lock acquire refused", second === "refused", String(second));
+    await first?.release();
+    const third = await MachineLock.acquire(stateDir).catch(() => null);
+    check("lock re-acquirable after release", third !== null);
+    await third?.release();
+  } finally {
+    await daemon.close();
+  }
+
+  // Stale port file: thin-CLI must refuse instead of opening a second
+  // Harness on the same SQLite (verified poison trigger).
+  await writeFile(path.join(stateDir, "raftd.port"), "127.0.0.1:4999\n");
+  const refused = await runCli(stateDir, ["list"]);
+  check("unreachable serve → CLI refuses second Harness", refused.code !== 0 && refused.out.includes("Refusing"), refused.out.trim().slice(0, 140));
+  await rm(path.join(stateDir, "raftd.port"), { force: true });
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 const t0 = Date.now();
@@ -666,6 +769,7 @@ try {
   await phaseI(STATE_DIR, record.agentId);
   await phaseJ(STATE_DIR, record.agentId);
   await phaseK(STATE_DIR);
+  await phaseL(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));

@@ -67,6 +67,35 @@ checkpoint 都先落盘（SQLite/JSONL）再执行——进程死了换个 Harne
 **语义要点**：路由投递不是"尽力而为"——帧先 commit 进 outbox 才路由，路由失败
 （unknown target）显式 bounce 回发件人（`route-bounce:` requestId），不会无限重传。
 
+## 第三轮新增（评审加固，2026-10-07）
+
+两个干净上下文的 subagent 扮用户批了 UX 和可靠性，以下修复全部按发现落地：
+
+| 缺陷 | 修法 |
+|---|---|
+| **运行中创建的提醒不触发**（ReminderService 只在 start 时布防一次） | daemon `remind/reschedule/delete` 后调 `reminderHook` → `resync()` 全量对账布防，新提醒即时生效（e2e 实测） |
+| `every 0s` 提交风暴把 outbox 打 unreliable | `parseWhen` 对重复提醒地板 ≥1s，直接报错拒绝 |
+| setTimeout >24.8d 溢出 → 远未来提醒立即触发且被消费 | delay 钳制到 INT32_MAX、唤醒时复查 dueAt（早醒重新布防）；投递失败保留行等下次启动重试，不再静默删除 |
+| **薄 CLI 静默降级**：serve 不可达时本地再开一个 Harness → 双写 SQLite → session poisoned | 有 `raftd.port` 且不可达 → 直接报错退出，绝不本地打开；`deliveries` 也补了远端路径 |
+| 发给 stopped/unreliable 目标的帧永久重传、堵住发送方 outbox | `routeMessage` 把 `AgentRegistryError`/`OutboxError`/`override=stopped` 归为永久失败 → 终态 bounce（`route-bounce:`）而非无限重试 |
+| `main` 收件箱无幂等：重传帧双写 | 投递用确定性 `msg-<agentId>-<clientSeq>` id 去重 |
+| 双 Harness 竞发同一帧（claimed 丢失即送） | 泵的 mark-commit 返回是否真认领，非认领者跳过 send |
+| `producedSubmissionIds` 环形 256 → 老 submission 驱逐后可再产帧 | 上限升 4096；幂等记忆全程 durable，仅最远尾部老化出列 |
+| pump 的 `onEvent` 监听器抛异常 → CommittedWatch 静默死 | emit 对每事件 try/catch，异常走 `onWarn` |
+| `attachPump` check-then-set 竞态 → 同一对话双订阅 | 同步先占位（placeholder），并发 attachPump 立即返回 |
+| `produceOutcome` 对 sticky/错误 turn 编造 `turn_completed{textEvents:1}` | 如实出 `terminal_failure`（sticky/运行错误）或真 0/0 计数，绝不虚构 |
+| `requeueInFlight` commit 失败静默 → in-flight 条目永久卡死 | 失败写入 `memoryUnreliable`：append/pump 立即报错，`resolve` 清除 |
+| MachineLock：EPERM 判死（夺走他人进程锁）、existsSync+writeFile 竞双持、重启后 PID 复用误拒 | EPERM→alive 拒绝；O_EXCL 原子创建；存活时查 `/proc/<pid>/cmdline` 非 raftd→外来 PID→stale 接管 |
+| `createAgent` 重名时先建 workspace+conversation 再撞名 | 提前 snapshot 查名 + workspace 路径强校验单层级；任何失败清理 workspace 目录 |
+| `daemon.events()` 遇坏行整流断 | 逐行 try，坏行跳过 |
+| serve：answer 无超时、畸形 JSON/重名/垃圾 whenBusy 全 500、裸绑 0.0.0.0 无鉴权 | answer 服务端 110s 封顶 → 504；错误映射 400/404/409/504；whenBusy 白名单；非回环无 `RAFTD_KEY` 打警告，`RAFTD_KEY` 设置后 /api/* 全要 Bearer |
+| `createAgent` 删 agent 后 transcript/deliveries 文件残留 | `deleteAgent` 连带删除两文件 |
+| "Session is poisoned"（评审实测遇到） | 根因是双 Harness 抢同一 SQLite → SQLITE_BUSY → commit 失败 → poison。上述"拒绝第二 Harness"+ 原子锁从根上断掉；重启 + `announceResume` 恢复 |
+
+另：**崩溃重启现在可见**——`resume()` 时若某 agent 尚有 queued/placed 提交，会投递一条
+durable systemNotice（"Host restarted — resuming N unfinished submission(s)"），控制台聊天流
+和 agent 上下文里都能看见"你被中断过"。
+
 ## 建议探索顺序
 
 1. `pnpm e2e` 一键跑端到端验证（真实 GLM 模型：问答→工具调用→崩溃恢复→steer→outbox）

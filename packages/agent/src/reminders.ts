@@ -40,6 +40,11 @@ export function parseWhen(spec: string, now = new Date()): { dueAt: string; ever
     const unit = rel[3].toLowerCase();
     const ms = n * (unit === "s" ? 1_000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000);
     const everyMs = rel[1].toLowerCase() === "every" ? ms : null;
+    // A repeating timer under 1s is a hot submit loop that bricks the
+    // agent's outbox (verified: `every 0s` → overflow → unreliable).
+    if (everyMs !== null && everyMs < 1_000) {
+      throw new Error(`repeating reminders need an interval >= 1s (got "${spec}")`);
+    }
     return { dueAt: new Date(now.getTime() + ms).toISOString(), everyMs };
   }
   const at = spec.match(/^at\s+(\d{1,2}):(\d{2})$/i);
@@ -54,49 +59,97 @@ export function parseWhen(spec: string, now = new Date()): { dueAt: string; ever
   throw new Error(`cannot parse when: "${spec}" (try "in 30m", "every 1h", "at 14:30", or ISO)`);
 }
 
+// Node clamps setTimeout delays > ~24.8 days to 1ms — without a wake-up
+// dueAt recheck, a "in 30d" reminder would fire (and be consumed) at once.
+const MAX_TIMEOUT_MS = 2_147_483_000;
+
 export class ReminderService {
-  private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly timers = new Map<string, { handle: NodeJS.Timeout; dueAt: string }>();
   private stopped = false;
 
-  constructor(private readonly daemon: DurableDaemon) {}
+  constructor(private readonly daemon: DurableDaemon) {
+    daemon.setReminderHook(() => void this.resync());
+  }
 
   /** Arm setTimeouts for every pending reminder; safe to call repeatedly. */
   async start(): Promise<void> {
+    await this.resync();
+  }
+
+  /**
+   * Reconcile armed setTimeouts with the durable doc — called on start and
+   * after every remind/reschedule/delete so live-created reminders fire
+   * without a restart.
+   */
+  async resync(): Promise<void> {
     const timers = await this.daemon.listReminders();
+    const byId = new Map(timers.map((t) => [t.id, t]));
+    for (const [id, armed] of [...this.timers]) {
+      const t = byId.get(id);
+      if (!t || t.dueAt !== armed.dueAt) {
+        clearTimeout(armed.handle);
+        this.timers.delete(id);
+      }
+    }
     for (const t of timers) this.arm(t);
   }
 
   stop(): void {
     this.stopped = true;
-    for (const t of this.timers.values()) clearTimeout(t);
+    for (const armed of this.timers.values()) clearTimeout(armed.handle);
     this.timers.clear();
   }
 
   private arm(t: Reminder): void {
     if (this.stopped || this.timers.has(t.id)) return;
-    const delay = Math.max(0, new Date(t.dueAt).getTime() - Date.now());
+    const delay = Math.min(Math.max(0, new Date(t.dueAt).getTime() - Date.now()), MAX_TIMEOUT_MS);
     const handle = setTimeout(() => void this.fire(t.id), delay);
     handle.unref?.();
-    this.timers.set(t.id, handle);
+    this.timers.set(t.id, { handle, dueAt: t.dueAt });
   }
 
   private async fire(id: string): Promise<void> {
     this.timers.delete(id);
-    const t = (await this.daemon.listReminders()).find((r) => r.id === id);
+    if (this.stopped) return;
+    let t: Reminder | undefined;
+    try {
+      t = (await this.daemon.listReminders()).find((r) => r.id === id);
+    } catch {
+      return; // session already closed
+    }
     if (!t) return;
-    await this.daemon
+    // Woke early (clamped long delay or clock jump): not due yet → re-arm.
+    const dueMs = new Date(t.dueAt).getTime() - Date.now();
+    if (dueMs > 60_000) {
+      this.arm(t);
+      return;
+    }
+    const delivered = await this.daemon
       .postMessage(t.agentId, `Reminder: ${t.text}`, {
         systemNotice: true,
         requestId: `reminder:${t.id}:${t.dueAt}`,
       })
-      .catch((err) => console.error(`[reminders] fire ${t.id} failed:`, err));
-    if (t.everyMs != null) {
-      await this.daemon.rescheduleReminder(t.id, new Date(Date.now() + t.everyMs).toISOString());
-    } else {
-      await this.daemon.deleteReminder(t.id);
+      .then(() => true)
+      .catch((err) => {
+        console.error(`[reminders] fire ${t!.id} failed:`, err);
+        return false;
+      });
+    if (!delivered) {
+      // Keep the row so the next serve start retries the fire instead of
+      // silently losing the reminder.
+      return;
+    }
+    try {
+      if (t.everyMs != null) {
+        await this.daemon.rescheduleReminder(t.id, new Date(Date.now() + t.everyMs).toISOString());
+      } else {
+        await this.daemon.deleteReminder(t.id);
+      }
+    } catch {
+      return; // session closed mid-fire; the row settles on next start
     }
     // Re-arm whatever came back (the repeat's next dueAt).
-    const next = (await this.daemon.listReminders()).find((r) => r.id === t.id);
+    const next = (await this.daemon.listReminders().catch(() => [] as Reminder[])).find((r) => r.id === t!.id);
     if (next) this.arm(next);
   }
 }

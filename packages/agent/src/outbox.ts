@@ -80,8 +80,11 @@ export function appendToOutboxDoc(
   if (dedupeKey !== undefined) {
     if (doc.producedSubmissionIds.includes(dedupeKey)) return { duplicate: true };
     doc.producedSubmissionIds.push(dedupeKey);
-    if (doc.producedSubmissionIds.length > 256) {
-      doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 256);
+    // Durable dedupe memory. Capped so the doc stays bounded; eviction means
+    // a >4096-settle-old submission could re-produce one frame — accepted,
+    // documented in NOTES.md (dedupe survives restart, only the far tail ages out).
+    if (doc.producedSubmissionIds.length > 4096) {
+      doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 4096);
     }
   }
   const clientSeq = doc.nextClientSeq++;
@@ -128,6 +131,8 @@ export class AgentOutbox {
   private stopped = false;
   private readonly retryDelayMs: (attempt: number) => number;
   private pendingNotify: (() => void) | null = null;
+  /** In-memory unreliability (a commit failure we couldn't even durably record). */
+  private memoryUnreliable: string | undefined;
 
   constructor(
     private readonly harness: Harness,
@@ -145,7 +150,7 @@ export class AgentOutbox {
   }
 
   async isUnreliable(): Promise<boolean> {
-    return (await this.state())?.unreliable != null;
+    return this.memoryUnreliable != null || (await this.state())?.unreliable != null;
   }
 
   /**
@@ -160,6 +165,9 @@ export class AgentOutbox {
     frame: OutboxFrame,
     dedupeKey?: string,
   ): Promise<{ clientSeq: number; result: OutboxAppendResult } | { duplicate: true }> {
+    if (this.memoryUnreliable) {
+      throw new OutboxError(`agent ${this.agentId} outbox is unreliable: ${this.memoryUnreliable}`, "unreliable");
+    }
     try {
       return await this.harness.commit(async (tx) => {
         const doc = await tx.doc(OutboxDoc, this.agentId, this.agentId);
@@ -224,6 +232,7 @@ export class AgentOutbox {
         entry.inFlight = false;
       }
     }, this.ctx);
+    this.memoryUnreliable = undefined;
     this.kick();
   }
 
@@ -236,8 +245,11 @@ export class AgentOutbox {
           entry.inFlight = false;
         }
       }, this.ctx);
-    } catch {
-      // A storage that cannot commit requeue stays unreliable in memory.
+    } catch (err) {
+      // A storage that cannot commit the requeue must not silently stall:
+      // mark the outbox memory-unreliable so appends/pumps surface it.
+      this.memoryUnreliable = `in-flight requeue failed: ${err instanceof Error ? err.message : String(err)}`;
+      return;
     }
     this.kick();
   }
@@ -272,24 +284,29 @@ export class AgentOutbox {
       for (;;) {
         if (this.stopped) return;
         const state = await this.state();
-        if (!state || state.unreliable) return;
+        if (!state || state.unreliable || this.memoryUnreliable) return;
         const next = state.entries.find((e) => !e.inFlight);
         if (!next) return;
         // Claim it durably first: a crash between mark and send is fine —
         // reopen requeues in-flight entries, and the consumer dedupes.
+        // Two processes racing the same entry: only the commit that flipped
+        // inFlight may send — the loser skips (verified double-delivery bug).
+        let claimed = false;
         try {
-          await this.harness.commit(async (tx) => {
+          claimed = await this.harness.commit(async (tx) => {
             const doc = await tx.doc(OutboxDoc, this.agentId, this.agentId);
             const entry = doc.entries.find((e) => e.clientSeq === next.clientSeq);
-            if (!entry || entry.inFlight) return;
+            if (!entry || entry.inFlight) return false;
             entry.inFlight = true;
             entry.attempts++;
             entry.lastAttemptAt = new Date().toISOString();
+            return true;
           }, this.ctx);
         } catch (err) {
           await this.markUnreliable(`in-flight mark write failed: ${err instanceof Error ? err.message : String(err)}`);
           return;
         }
+        if (!claimed) continue;
         try {
           await this.transport.send({
             agentId: this.agentId,
