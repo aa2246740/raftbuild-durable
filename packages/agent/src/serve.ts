@@ -113,6 +113,11 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
             json(res, 202, r);
             return;
           }
+          if (req.method === "GET" && parts[3] === "feed") {
+            const tail = Math.min(Number(url.searchParams.get("tail") ?? "200") || 200, 500);
+            json(res, 200, { items: await daemon.chatFeed(id, tail) });
+            return;
+          }
           if (req.method === "GET" && parts[3] === "events") {
             const tail = Math.min(Number(url.searchParams.get("tail") ?? "100") || 100, 500);
             const record = await daemon.getAgent(id);

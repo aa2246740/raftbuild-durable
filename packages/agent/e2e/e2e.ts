@@ -456,8 +456,15 @@ async function phaseH(stateDir: string, alphaId: string) {
       2_000,
     );
     check("alpha→beta message routed (durable submission on beta)", routed);
-    const routeSub = routed ? await submissionWithRequestId(beta.agentId, `route:${alphaId}:`) : undefined;
-    check("routed submission settled", routeSub !== undefined && routeSub.status === "done", routeSub?.status ?? "-");
+    const settled = routed
+      ? await waitFor(
+          "routed submission settled",
+          async () => (await submissionWithRequestId(beta.agentId, `route:${alphaId}:`))?.status === "done",
+          180_000,
+          2_000,
+        )
+      : false;
+    check("routed submission settled", settled);
 
     // 2) beta → main (operator inbox).
     await daemon.postMessage(

@@ -110,6 +110,28 @@ export interface Answer {
   reason?: string;
 }
 
+/** One row of the console's chat feed for a conversation. */
+export type ChatItem = {
+  role: "user" | "agent" | "tool";
+  text: string;
+  /** Envelope sender handle for user rows ("operator", another agent's name). */
+  from?: string;
+  name?: string;
+  args?: string;
+  isError?: boolean;
+  thinking?: string;
+  toolCalls?: { id: string; name: string; args: string }[];
+};
+
+const messageText = (content: unknown): string =>
+  typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : ""))
+          .join("\n")
+      : "";
+
 
 const DEFAULT_MEMORY_MD = (name: string) =>
   `# ${name}\n\nLong-term memory for this agent. Add durable facts here as you learn them.\n`;
@@ -522,6 +544,46 @@ export class DurableDaemon {
       const doc = await tx.doc(RemindersDoc);
       doc.timers = doc.timers.filter((r) => r.id !== id);
     }, BACKGROUND_CONTEXT);
+  }
+
+  /** Chat-shaped feed of a conversation for the console: user/agent/tool rows. */
+  async chatFeed(agentIdOrName: string, limit = 200): Promise<ChatItem[]> {
+    const record = await this.getAgent(agentIdOrName);
+    const conversationId = Number(record.conversationId) as ConversationId;
+    const items: ChatItem[] = [];
+    let cursor;
+    for (;;) {
+      const page = await this.storage.scanEntries({ conversationId }, 500, cursor, BACKGROUND_CONTEXT);
+      for (const entry of page.items) {
+        for (const m of entry.model ?? []) {
+          if (m.role === "user") {
+            const raw = messageText(m.content);
+            // Strip the [target=…] envelope so the console shows what was meant;
+            // indented continuation lines belong to the body, trailers don't.
+            const env = raw.match(/\[target=[^\]]*\] @([\w.-]+): ([^\n]*)\n?((?: {2}[^\n]*\n?)*)/);
+            const text = env ? env[2] + (env[3] ? "\n" + env[3].split("\n").map((l) => l.replace(/^ {2}/, "")).join("\n").trimEnd() : "") : raw;
+            items.push({ role: "user", text, ...(env ? { from: env[1] } : {}) });
+          } else if (m.role === "assistant") {
+            const text = m.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n");
+            const thinking = m.content.filter((c) => c.type === "thinking").map((c) => (c as { thinking: string }).thinking).join("\n");
+            const toolCalls = m.content
+              .filter((c) => c.type === "toolCall")
+              .map((c) => {
+                const t = c as { id: string; name: string; arguments: unknown };
+                return { id: t.id, name: t.name, args: JSON.stringify(t.arguments).slice(0, 300) };
+              });
+            items.push({ role: "agent", text, ...(thinking ? { thinking } : {}), ...(toolCalls.length ? { toolCalls } : {}) });
+          } else if (m.role === "toolResult") {
+            const t = m as { toolName: string; content: unknown; isError: boolean };
+            items.push({ role: "tool", name: t.toolName, text: messageText(t.content).slice(0, 500), isError: t.isError });
+          }
+        }
+      }
+      if (page.next === undefined) break;
+      cursor = page.next;
+    }
+    // scanEntries returns newest-first; the console wants chat order.
+    return items.reverse().slice(-limit);
   }
 
   /** All durable submissions admitted on an agent's conversation, any status. */

@@ -32,15 +32,19 @@ export const CONSOLE_HTML = `<!doctype html>
   #chat { flex:1; display:flex; flex-direction:column; min-width:0; }
   #chat-head { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
   #chat-head .t { font-weight:600; }
-  #events { flex:1; overflow-y:auto; padding:16px; font-family:ui-monospace, "SF Mono", Menlo, monospace; font-size:12.5px; }
-  .ev { margin-bottom:6px; white-space:pre-wrap; word-break:break-word; }
-  .ev .k { color:var(--mut); }
-  .ev.text .v { color:var(--fg); }
-  .ev.tool_call .v { color:var(--warn); }
-  .ev.tool_output .v { color:#79c0ff; }
-  .ev.error .v { color:var(--bad); }
-  .ev.thinking .v { color:var(--mut); font-style:italic; }
-  .ev.system { color:var(--warn); }
+  #events { flex:1; overflow-y:auto; padding:16px; font-size:13.5px; }
+  .row { margin-bottom:10px; max-width:78%; }
+  .row .body { padding:9px 13px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
+  .row.user { margin-left:auto; }
+  .row.user .body { background:#1f6feb33; border:1px solid #1f6feb66; }
+  .row.agent .body { background:var(--panel); border:1px solid var(--line); }
+  .row.tool { max-width:100%; }
+  .row.tool .body { background:transparent; border:1px dashed var(--line); padding:6px 10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--mut); }
+  .row.tool .body.err { border-color:var(--bad); color:var(--bad); }
+  .row .who { font-size:11px; color:var(--mut); margin-bottom:3px; }
+  .row.user .who { text-align:right; }
+  .tc { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--warn); margin-top:5px; }
+  .tk { font-size:12px; color:var(--mut); font-style:italic; margin-top:5px; border-left:2px solid var(--line); padding-left:8px; }
   #composer { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
   #composer input { flex:1; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 12px; font:inherit; }
   #composer select, button { background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 14px; font:inherit; cursor:pointer; }
@@ -90,13 +94,13 @@ export const CONSOLE_HTML = `<!doctype html>
       <span class="t" id="chat-title">Select an agent</span>
       <span class="badge" id="chat-badge"></span>
       <span style="flex:1"></span>
-      <button onclick="agentAction('stop')">stop</button>
-      <button onclick="agentAction('start')">start</button>
-      <button onclick="delAgent()">delete</button>
+      <button id="btn-stop" onclick="agentAction('stop')" disabled>stop</button>
+      <button id="btn-start" onclick="agentAction('start')" disabled>start</button>
+      <button id="btn-del" onclick="delAgent()" disabled>delete</button>
     </div>
     <div id="events"><div class="empty">Create or select an agent.<br>Every agent is durable: kill the process, it resumes where it left off.</div></div>
     <div id="composer">
-      <select id="whenbusy"><option value="">deliver when free</option><option value="steer">steer (interrupt)</option><option value="followUp">follow up</option></select>
+      <select id="whenbusy"><option value="">when busy: queue</option><option value="steer">when busy: interrupt</option><option value="followUp">when busy: follow up</option></select>
       <input id="msg" placeholder="message the agent…" onkeydown="if(event.key==='Enter')send()">
       <button class="primary" onclick="send()">Send</button>
     </div>
@@ -122,10 +126,13 @@ async function refresh() {
   try { state = await api('state'); } catch (e) { return; }
   $('usage').textContent = state.usage && state.usage.total ? 'tokens: ' + JSON.stringify(state.usage.total).slice(0,80) : '';
   const lcs = Object.fromEntries((state.lifecycles||[]).map(l => [l.agentId, l]));
-  $('agents').innerHTML = (state.agents||[]).map(a =>
+  $('agents').innerHTML = (state.agents||[]).length ? (state.agents||[]).map(a =>
     '<div class="agent' + (sel===a.agentId?' sel':'') + '" onclick="selectAgent(\\'' + a.agentId + '\\')">' +
     '<div class="name">' + esc(a.name) + '</div>' +
-    '<div class="meta">' + lcBadge(lcs[a.agentId]) + '<span>' + esc(a.model.modelId) + '</span></div></div>').join('');
+    '<div class="meta">' + lcBadge(lcs[a.agentId]) + '<span>' + esc(a.model.modelId) + '</span></div></div>').join('')
+    : '<div class="small">No agents yet — create one below.</div>';
+  const hasSel = !!sel && (state.agents||[]).some(a => a.agentId === sel);
+  $('btn-stop').disabled = $('btn-start').disabled = $('btn-del').disabled = !hasSel;
   $('inbox').innerHTML = (state.mainInbox||[]).slice(-50).reverse().map(m =>
     '<div class="feed-item"><div class="who">@' + esc(m.fromName) + '</div><div>' + esc(m.text) + '</div><div class="at">' + esc(m.at) + '</div></div>').join('') || '<div class="small">Nothing yet — agents message target "main" via send_message.</div>';
   $('reminders').innerHTML = (state.reminders||[]).map(r =>
@@ -142,23 +149,24 @@ async function refreshEvents() {
   $('chat-title').textContent = a.name;
   const lc = (state.lifecycles||[]).find(l => l.agentId === sel);
   $('chat-badge').outerHTML = lcBadge(lc);
-  const { events } = await api('agents/' + encodeURIComponent(a.agentId) + '/events?tail=120');
-  $('events').innerHTML = events.map(e => renderEvent(e)).join('');
+  const { items } = await api('agents/' + encodeURIComponent(a.agentId) + '/feed?tail=150');
+  $('events').innerHTML = items.length ? items.map(e => renderItem(e)).join('')
+    : '<div class="empty">No history yet — say hello below.</div>';
   $('events').scrollTop = $('events').scrollHeight;
 }
 
-function renderEvent(e) {
-  const k = e.kind || e.type || 'event';
-  let v = '';
-  if (k === 'text') v = e.text;
-  else if (k === 'thinking') v = e.text;
-  else if (k === 'tool_call') v = '→ ' + e.name + ' ' + JSON.stringify(e.input||{}).slice(0,200);
-  else if (k === 'tool_output') v = (e.isError?'✗ ':'✓ ') + String(e.text||'').slice(0,400);
-  else if (k === 'error') v = e.message;
-  else if (k === 'submission_settled') v = 'submission ' + e.submissionId + ' → ' + e.status;
-  else if (k === 'run_start' || k === 'run_end') v = k;
-  else v = JSON.stringify(e).slice(0,300);
-  return '<div class="ev ' + k + '"><span class="k">' + esc(k) + '</span> <span class="v">' + esc(v) + '</span></div>';
+function renderItem(e) {
+  if (e.role === 'user') {
+    return '<div class="row user"><div class="who">' + esc(e.from || 'you') + '</div><div class="body">' + esc(e.text) + '</div></div>';
+  }
+  if (e.role === 'tool') {
+    return '<div class="row tool"><div class="who">' + esc(e.name||'tool') + '</div><div class="body' + (e.isError?' err':'') + '">' + esc(e.text) + '</div></div>';
+  }
+  let inner = '';
+  if (e.thinking) inner += '<div class="tk">' + esc(e.thinking.slice(0,400)) + '</div>';
+  if (e.text) inner += esc(e.text);
+  for (const c of (e.toolCalls||[])) inner += '<div class="tc">→ ' + esc(c.name) + ' ' + esc(c.args) + '</div>';
+  return '<div class="row agent"><div class="who">' + 'agent</div><div class="body">' + inner + '</div></div>';
 }
 
 async function send() {
