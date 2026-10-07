@@ -23,7 +23,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { DurableDaemon } from "./daemon.ts";
 import { MachineLock } from "./machineLock.ts";
-import { ReminderService } from "./reminders.ts";
+import { parseWhen, ReminderService } from "./reminders.ts";
 import { startServer } from "./serve.ts";
 import type { AgentModelRef } from "./types.ts";
 
@@ -107,10 +107,18 @@ async function main(): Promise<number> {
     }
   }
 
+  const compactIdleEnv = String(process.env.RAFTD_COMPACT_IDLE_MS ?? "").trim();
+  const compactIdleMs = compactIdleEnv
+    ? (/^\d+\s*(s|m|h|d)$/i.test(compactIdleEnv)
+        ? parseWhen(`every ${compactIdleEnv}`).everyMs ?? undefined
+        : Number(compactIdleEnv) || undefined)
+    : (cmd === "serve" ? 30 * 60_000 : undefined);
   const daemon = await DurableDaemon.open({
     stateDir,
     providers: "env",
     defaultModel: modelRef(process.env.RAFTD_MODEL) ?? DEFAULT_MODEL,
+    compactOnWakeMs: compactIdleMs,
+    onWarn: (m) => console.error(`[warn] ${m}`),
   });
   const shutdown = async () => {
     await daemon.close();

@@ -42,6 +42,8 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 - **双开拒绝**：`raftd.lock`（pid+token）防止第二个 serve 抢 storage；CLI 自动降级成 HTTP 薄客户端
 - **工作区沙箱**：每个 agent 的工作目录被约束在 `workspaces/` 下一级
 - **可打断**：`steer` 往运行中的轮次里插话；`whenBusy` 三档（steer/followUp/排队）
+- **冷唤醒回收**：agent 静默超过阈值，下条消息先自动压缩上下文再跑——长驻不费 token
+  （serve 默认 30m，`RAFTD_COMPACT_IDLE_MS=0` 关闭，e2e phase K 实测）
 
 ## 布局
 
@@ -64,7 +66,7 @@ pnpm typecheck && pnpm e2e    # 需要模型 key；报告写到 e2e/report.md
 
 当前 e2e 覆盖：真实 GLM 问答 / bash 写文件 / SIGKILL 原地复活 / steer 插队 /
 outbox 十项不变量 / agent 互发消息 / 收件箱 / 弹回 / 提醒触发 / 锁与双开 /
-serve HTTP+控制台+薄 CLI。
+serve HTTP+控制台+薄 CLI / 冷唤醒压缩。
 
 ## 常见问题
 

@@ -46,7 +46,7 @@
 
 | # | 功能 | daemon | 本版状态 |
 |---|---|---|---|
-| 25 | cold-idle 自动清理 | 空闲冷进程定时 stop | **缺失**（好做：idle 超时→compact） |
+| 25 | cold-idle 自动清理 | 空闲冷进程定时 stop | **已有**：冷唤醒回收——静默超阈值后下条消息先 compact（serve 默认 30m，e2e phase K 实测） |
 | 26 | 准入/限速 | agentStartCoordinator 队列+rate limit | **缺失** |
 | 27 | 用量统计 | runtimeAccountUsage 收集 provider 配额 | **部分**（usage() 已接 pi-durable 原生） |
 | 28 | 模型探测 | runtime_models:detect / providerProbe | **已有**（detectEnvProviders） |
@@ -77,7 +77,7 @@
 1. **Web 控制台**（#7）——没有界面就不是产品
 2. **agent↔agent 路由回环**（#4）——群聊是 raft 的灵魂
 3. **提醒/定时唤醒**（#9）——"长驻"体验的关键差异
-4. **machineLock + cold-idle + 限速**（#23/25/26）——交付级可靠性
+4. **machineLock + cold-idle + 限速**（#23/25/26）——锁和冷唤醒回收已交付；限速单机低优先
 5. **managed 工具面**（#34）——agent 能 `raft message send` 才形成闭环
 6. **cold-wake 简报 recycle**（#8）——成本优化，原版 RFC 070 的精华
 

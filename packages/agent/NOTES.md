@@ -61,6 +61,7 @@ checkpoint 都先落盘（SQLite/JSONL）再执行——进程死了换个 Harne
 | `serve.ts` + `consoleHtml.ts` | HTTP API + 零构建单文件控制台 | `POST /api/agents`、消息、events/outbox/lifecycle、answer 长轮询、`/api/state` 一把抓 |
 | `reminders.ts` | durable 定时器（"in 30m"/"every 1h"/"at 14:30"/ISO） | `raft.reminders` session doc 落盘 + 进程内 setTimeout；重启重新布防，到期以 systemNotice 投递（`requestId=reminder:<id>:<dueAt>` 防重） |
 | `machineLock.ts` | 单实例锁 `raftd.lock`（pid+token） | serve 启动时拿锁；第二个 serve 直接拒起；CLI 其他命令发现 `raftd.port` 就降级成 HTTP 薄客户端——两个 Harness 永不同时开一份 storage |
+| 冷唤醒回收（RFC 070） | 静默超阈值→下条消息先 compact 再跑 | `compactOnWakeMs` 只看本 daemon 目击的活跃（重启不算 idle，不白烧模型调用）；compact 失败仅 `onWarn`，不挡消息。serve 默认 30m，`RAFTD_COMPACT_IDLE_MS` 覆盖 |
 | `cli.ts runRemote` | 薄客户端模式 | 有 `raftd.port` 且 API 可达 → 全部命令走 HTTP |
 
 **语义要点**：路由投递不是"尽力而为"——帧先 commit 进 outbox 才路由，路由失败

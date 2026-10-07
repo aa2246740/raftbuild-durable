@@ -617,6 +617,42 @@ async function phaseJ(stateDir: string, alphaId: string) {
   check("port file cleaned up", !existsSync(path.join(stateDir, "raftd.port")));
 }
 
+// ── K: cold-wake recycle (RFC 070) ──────────────────────────────────────────
+
+async function phaseK(stateDir: string) {
+  phase("K — cold-wake recycle compacts after idle silence");
+  const daemon = await DurableDaemon.open({
+    stateDir,
+    providers: "env",
+    defaultModel: MODEL,
+    compactOnWakeMs: 1_500,
+  });
+  try {
+    const { record } = await daemon.createAgent({
+      name: "kappa",
+      model: MODEL,
+      instructions: "Reply with one short word each time.",
+    });
+    let compactCalls = 0;
+    const orig = daemon.compact.bind(daemon);
+    (daemon as unknown as { compact: typeof orig }).compact = async (...a: Parameters<typeof orig>) => {
+      compactCalls++;
+      return orig(...a);
+    };
+    const m1 = await daemon.postMessage(record.agentId, "Say ONE", { raw: true });
+    const a1 = await daemon.waitForAnswer(m1.submissionId);
+    check("first message answered", a1.status === "done", a1.status);
+    check("no compact on first message (no observed idle)", compactCalls === 0, `calls=${compactCalls}`);
+    await sleep(2_000); // go quiet past the 1.5s threshold
+    const m2 = await daemon.postMessage(record.agentId, "Say TWO", { raw: true });
+    check("wake-compact triggered once", compactCalls === 1, `calls=${compactCalls}`);
+    const a2 = await daemon.waitForAnswer(m2.submissionId);
+    check("message still answered after recycle", a2.status === "done", a2.status);
+  } finally {
+    await daemon.close();
+  }
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 const t0 = Date.now();
@@ -629,6 +665,7 @@ try {
   await phaseH(STATE_DIR, record.agentId);
   await phaseI(STATE_DIR, record.agentId);
   await phaseJ(STATE_DIR, record.agentId);
+  await phaseK(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));

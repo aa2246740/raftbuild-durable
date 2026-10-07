@@ -85,6 +85,16 @@ export interface DurableDaemonOptions {
   onEvent?: (agentId: string, event: ParsedEvent) => void;
   /** Called when an outbox frame is produced, before delivery. */
   onFrame?: (agentId: string, clientSeq: number) => void;
+  /**
+   * Cold-wake recycle (raft RFC 070): when an agent the daemon has seen
+   * active goes quiet for longer than this, its next postMessage first runs
+   * a compaction pass so the resumed turn starts on a lean context. A daemon
+   * restart does NOT count as idle — cold start never burns a model call.
+   * Default off; `raftd serve` enables it (RAFTD_COMPACT_IDLE_MS, 30m).
+   */
+  compactOnWakeMs?: number;
+  /** Called for non-fatal internal warnings (compaction, routing bounces). */
+  onWarn?: (message: string) => void;
 }
 
 export interface CreateAgentResult {
@@ -152,6 +162,8 @@ export class DurableDaemon {
   private readonly outboxes = new Map<string, AgentOutbox>();
   private readonly pumps = new Map<string, { stop: () => Promise<unknown> }>();
   private readonly normalizers = new Map<string, DurableEventNormalizer>();
+  /** Last daemon-observed inbound activity per agent (cold-wake recycle). */
+  private readonly lastActivity = new Map<string, number>();
   private closed = false;
 
   static async open(options: DurableDaemonOptions): Promise<DurableDaemon> {
@@ -419,6 +431,14 @@ export class DurableDaemon {
     }
     const conversation = await this.requireConversation(record);
     await this.resumeAgent(record);
+    if (this.opts.compactOnWakeMs) {
+      const last = this.lastActivity.get(record.agentId);
+      if (last !== undefined && Date.now() - last > this.opts.compactOnWakeMs) {
+        await this.compact(record.agentId, "Recycled cold context: the agent was idle; keep only what matters for continuing this work.")
+          .catch((err) => this.opts.onWarn?.(`wake-compact failed for ${record.name}: ${err}`));
+      }
+    }
+    this.lastActivity.set(record.agentId, Date.now());
     let content: string;
     if (typeof input === "string") {
       content = options.raw
