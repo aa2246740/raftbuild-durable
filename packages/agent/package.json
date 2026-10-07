@@ -7,12 +7,15 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "cli": "node --experimental-transform-types src/cli.ts",
+    "e2e": "node --experimental-transform-types e2e/e2e.ts",
     "example:recovery": "node --experimental-strip-types examples/13-recovery.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.4",
-    "@earendil-works/pi-ai": "1.0.2",
-    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "@earendil-works/pi-durable": "1.0.4",
     "typebox": "1.1.38",
     "zod": "^4.3.6"
