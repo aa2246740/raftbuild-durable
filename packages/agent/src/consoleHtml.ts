@@ -134,7 +134,10 @@ function lcBadge(lc) {
 
 async function refresh() {
   try { state = await api('state'); } catch (e) { return; }
-  $('usage').textContent = state.usage && state.usage.total ? 'tokens: ' + JSON.stringify(state.usage.total).slice(0,80) : '';
+  const mods = (state.usage && state.usage.models) || {};
+  let tk = 0, cost = 0;
+  for (const k of Object.keys(mods)) { tk += mods[k].totalTokens || 0; cost += (mods[k].cost && mods[k].cost.total) || 0; }
+  $('usage').textContent = tk ? 'tokens: ' + (tk >= 1000 ? (tk/1000).toFixed(1) + 'k' : tk) + ' · cost: $' + cost.toFixed(4) : '';
   const lcs = Object.fromEntries((state.lifecycles||[]).map(l => [l.agentId, l]));
   $('agents').innerHTML = (state.agents||[]).length ? (state.agents||[]).map(a =>
     '<div class="agent' + (sel===a.agentId?' sel':'') + '" onclick="selectAgent(\\'' + a.agentId + '\\')">' +
