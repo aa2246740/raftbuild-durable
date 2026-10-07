@@ -93,6 +93,7 @@ export const CONSOLE_HTML = `<!doctype html>
     <div id="chat-head">
       <span class="t" id="chat-title">Select an agent</span>
       <span class="badge" id="chat-badge"></span>
+      <span class="err small" id="chat-err"></span>
       <span style="flex:1"></span>
       <button id="btn-stop" onclick="agentAction('stop')" disabled>stop</button>
       <button id="btn-start" onclick="agentAction('start')" disabled>start</button>
@@ -100,7 +101,7 @@ export const CONSOLE_HTML = `<!doctype html>
     </div>
     <div id="events"><div class="empty">Create or select an agent.<br>Every agent is durable: kill the process, it resumes where it left off.</div></div>
     <div id="composer">
-      <select id="whenbusy"><option value="">when busy: queue</option><option value="steer">when busy: interrupt</option><option value="followUp">when busy: follow up</option></select>
+      <select id="whenbusy"><option value="" title="wait in line behind the current turn">queue (default)</option><option value="steer" title="inject into the running turn now">interrupt the run</option><option value="followUp" title="send right after the current turn finishes">follow up next</option></select>
       <input id="msg" placeholder="message the agent…" onkeydown="if(event.key==='Enter')send()">
       <button class="primary" onclick="send()">Send</button>
     </div>
@@ -148,8 +149,9 @@ async function refresh() {
   $('btn-stop').disabled = $('btn-start').disabled = $('btn-del').disabled = !hasSel;
   $('inbox').innerHTML = (state.mainInbox||[]).slice(-50).reverse().map(m =>
     '<div class="feed-item"><div class="who">@' + esc(m.fromName) + '</div><div>' + esc(m.text) + '</div><div class="at">' + esc(m.at) + '</div></div>').join('') || '<div class="small">Nothing yet — agents message target "main" via send_message.</div>';
+  const names = Object.fromEntries((state.agents||[]).map(a => [a.agentId, a.name]));
   $('reminders').innerHTML = (state.reminders||[]).map(r =>
-    esc(r.agentId.slice(0,12)) + ' · ' + esc(r.text).slice(0,40) + ' · ' + esc(r.dueAt) + (r.everyMs? ' ↻':'') +
+    esc(names[r.agentId] || r.agentId.slice(0,12)) + ' · ' + esc(r.text).slice(0,40) + ' · ' + esc(r.dueAt) + (r.everyMs? ' ↻':'') +
     ' <a href="#" style="color:var(--bad)" onclick="delReminder(\\'' + r.id + '\\');return false">✕</a>').join('<br>');
   if (sel) await refreshEvents();
 }
@@ -165,6 +167,9 @@ async function refreshEvents() {
   const badge = $('chat-badge');
   badge.textContent = kind;
   badge.className = 'badge ' + kind;
+  $('chat-err').textContent = (kind === 'cooldown' || kind === 'terminal') && lc && lc.detail
+    ? '⚠ ' + lc.detail
+    : '';
   try {
     const { items } = await api('agents/' + encodeURIComponent(a.agentId) + '/feed?tail=150');
     $('events').innerHTML = items.length ? items.map(e => renderItem(e)).join('')
