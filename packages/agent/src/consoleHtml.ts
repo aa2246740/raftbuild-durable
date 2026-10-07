@@ -158,11 +158,18 @@ async function refreshEvents() {
   if (!a) { sel = null; return; }
   $('chat-title').textContent = a.name;
   const lc = (state.lifecycles||[]).find(l => l.agentId === sel);
-  $('chat-badge').outerHTML = lcBadge(lc);
-  const { items } = await api('agents/' + encodeURIComponent(a.agentId) + '/feed?tail=150');
-  $('events').innerHTML = items.length ? items.map(e => renderItem(e)).join('')
-    : '<div class="empty">No history yet — say hello below.</div>';
-  $('events').scrollTop = $('events').scrollHeight;
+  const kind = (lc && lc.kind) || 'unknown';
+  const badge = $('chat-badge');
+  badge.textContent = kind;
+  badge.className = 'badge ' + kind;
+  try {
+    const { items } = await api('agents/' + encodeURIComponent(a.agentId) + '/feed?tail=150');
+    $('events').innerHTML = items.length ? items.map(e => renderItem(e)).join('')
+      : '<div class="empty">No history yet — say hello below.</div>';
+    $('events').scrollTop = $('events').scrollHeight;
+  } catch {
+    $('events').innerHTML = '<div class="empty">Agent is gone or the daemon is restarting.</div>';
+  }
 }
 
 function renderItem(e) {
