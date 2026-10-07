@@ -1,0 +1,73 @@
+{
+  "name": "@botiverse/raft-daemon",
+  "version": "1.0.43",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "type": "module",
+  "bin": {
+    "raft-daemon": "dist/raft-daemon.js",
+    "slock-daemon": "dist/slock-daemon.js"
+  },
+  "exports": {
+    "./core": {
+      "types": "./src/core.ts",
+      "import": "./dist/core.js"
+    },
+    "./dist/raft-daemon.js": "./dist/raft-daemon.js",
+    "./dist/slock-daemon.js": "./dist/slock-daemon.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/raft-source.git",
+    "directory": "packages/daemon"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @botiverse/raft build && node --watch --import @oxc-node/core/register src/index.ts",
+    "start": "node --import @oxc-node/core/register src/index.ts",
+    "build": "pnpm --filter @botiverse/raft build && tsdown && node -e \"require('fs').cpSync('../cli/dist','dist/cli',{recursive:true})\" && node scripts/write-dist-bins.mjs",
+    "test": "vitest run",
+    "test:sea-host": "vitest run --config vitest.sea-host.config.ts",
+    "prepack": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "generate:raft-cli-guide": "node --import @oxc-node/core/register scripts/generate-raft-cli-guide.ts",
+    "check:raft-cli-guide-fresh": "pnpm generate:raft-cli-guide && git diff --exit-code ../../manual/agent-knowledge/raft-cli-overview.md",
+    "generate:pi-builtin-models": "node --import @oxc-node/core/register scripts/generate-pi-builtin-models.ts",
+    "check:pi-builtin-models-fresh": "pnpm generate:pi-builtin-models && git diff --exit-code ../shared/src/piBuiltinModels.generated.ts",
+    "release:sdk-preflight": "node scripts/release-runtime-sdk-preflight.mjs"
+  },
+  "dependencies": {
+    "@botiverse/kimi-code-sdk": "0.34.0-botiverse.0",
+    "@botiverse/oar": "0.20.0",
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@jackwener/opencli": "^1.8.3",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ajv": "^8.18.0",
+    "commander": "^12.1.0",
+    "https-proxy-agent": "^7.0.6",
+    "safe-regex2": "5.1.1",
+    "tar-stream": "2.2.0",
+    "typebox": "1.1.38",
+    "undici": "^7.29.1",
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@botiverse/raft": "workspace:*",
+    "@botiverse/raft-shared": "workspace:*",
+    "@botiverse/raft-trace-client": "workspace:*",
+    "@oxc-node/core": "^0.1.3",
+    "@types/node": "^25.5.0",
+    "@types/tar-stream": "3.1.4",
+    "@types/ws": "^8.18.1",
+    "diff": "8.0.4",
+    "fast-check": "^4.8.0",
+    "tsdown": "^0.23.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.2"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@raftbuild-durable/agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "example:recovery": "node --experimental-strip-types examples/13-recovery.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@earendil-works/pi-durable": "1.0.4",
+    "typebox": "1.1.38",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.3"
+  }
+}
