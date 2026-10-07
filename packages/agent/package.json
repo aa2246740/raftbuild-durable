@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "cli": "node --experimental-transform-types src/cli.ts",
     "e2e": "node --experimental-transform-types e2e/e2e.ts",
-    "example:recovery": "node --experimental-strip-types examples/13-recovery.ts"
+    "example:recovery": "node --experimental-strip-types examples/13-recovery.ts",
+    "raftd": "node --experimental-transform-types src/cli.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.4",
@@ -23,5 +24,8 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "typescript": "^6.0.3"
+  },
+  "bin": {
+    "raftd": "src/cli.ts"
   }
 }

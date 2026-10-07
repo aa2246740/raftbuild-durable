@@ -518,7 +518,14 @@ async function phaseI(stateDir: string, agentId: string) {
     await svc.start();
     check(
       "reminder fired into the conversation",
-      await waitFor("transcript saw CHIME-42", () => transcriptHas(stateDir, agentId, "CHIME-42"), 60_000, 500),
+      // The feed carries the submitted input text; the transcript does NOT
+      // echo inputs — checking it relied on the model parroting the marker.
+      await waitFor(
+        "feed saw CHIME-42",
+        async () => (await daemon.chatFeed(agentId)).some((i) => (i.text ?? "").includes("CHIME-42")),
+        60_000,
+        500,
+      ),
     );
     check("one-shot removed after firing", !(await daemon.listReminders()).some((t) => t.id === r.id));
   } finally {

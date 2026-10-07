@@ -85,7 +85,7 @@ checkpoint 都先落盘（SQLite/JSONL）再执行——进程死了换个 Harne
 | `attachPump` check-then-set 竞态 → 同一对话双订阅 | 同步先占位（placeholder），并发 attachPump 立即返回 |
 | `produceOutcome` 对 sticky/错误 turn 编造 `turn_completed{textEvents:1}` | 如实出 `terminal_failure`（sticky/运行错误）或真 0/0 计数，绝不虚构 |
 | `requeueInFlight` commit 失败静默 → in-flight 条目永久卡死 | 失败写入 `memoryUnreliable`：append/pump 立即报错，`resolve` 清除 |
-| MachineLock：EPERM 判死（夺走他人进程锁）、existsSync+writeFile 竞双持、重启后 PID 复用误拒 | EPERM→alive 拒绝；O_EXCL 原子创建；存活时查 `/proc/<pid>/cmdline` 非 raftd→外来 PID→stale 接管 |
+| MachineLock：EPERM 判死（夺走他人进程锁）、existsSync+writeFile 竞双持、重启后 PID 复用误拒 | EPERM→alive 拒绝；O_EXCL 原子创建；存活时比对 `/proc/<pid>/stat` 内核启动时间，不一致=回收 PID→stale 接管 |
 | `createAgent` 重名时先建 workspace+conversation 再撞名 | 提前 snapshot 查名 + workspace 路径强校验单层级；任何失败清理 workspace 目录 |
 | `daemon.events()` 遇坏行整流断 | 逐行 try，坏行跳过 |
 | serve：answer 无超时、畸形 JSON/重名/垃圾 whenBusy 全 500、裸绑 0.0.0.0 无鉴权 | answer 服务端 110s 封顶 → 504；错误映射 400/404/409/504；whenBusy 白名单；非回环无 `RAFTD_KEY` 打警告，`RAFTD_KEY` 设置后 /api/* 全要 Bearer |
@@ -103,4 +103,5 @@ durable systemNotice（"Host restarted — resuming N unfinished submission(s)"�
 3. 读 `src/daemon.ts` 总装 → `src/outbox.ts` 可靠性 → `src/events.ts` 事件归一化
 4. 对照 `reference/raft-daemon/src/` 同名文件看移植取舍
 
-上游示例全集在 `pi` 仓库 `packages/durable/test/examples/`（00–31）。
+上游示例全集在 pi 仓库 `packages/durable/test/examples/`（00–31，见 earendil-works/pi
+GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/13-recovery.ts）。

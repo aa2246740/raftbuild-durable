@@ -24,27 +24,36 @@ export class MachineLockError extends Error {
   }
 }
 
-type LockOwner = { pid: number; token: string; startedAt: string };
+type LockOwner = { pid: number; token: string; startedAt: string; pidStart?: string };
 
-/** true = alive; false = dead; "foreign" = alive but clearly not raftd. */
-function pidStatus(pid: number): "alive" | "dead" | "foreign" {
+/** /proc/<pid>/stat field 22 — kernel starttime, survives nothing but the pid itself. */
+function processStartTime(pid: number): string | undefined {
   try {
-    process.kill(pid, 0);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // EPERM = the process exists but is another user's — alive, not dead.
-    if (code === "EPERM") return "alive";
-    return "dead";
-  }
-  // Alive: verify it isn't a recycled pid wearing our lock. On Linux read
-  // /proc/<pid>/cmdline; unreadable (macOS, sandbox) → trust the pid.
-  try {
-    const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
-    if (cmdline && !/cli\.ts|raftd/i.test(cmdline)) return "foreign";
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm may contain spaces/parens — parse after the last ')'.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return fields[19]; // field 22 overall
   } catch {
-    /* no /proc or races — treat as ours */
+    return undefined;
   }
-  return "alive";
+}
+
+/** true = the recorded owner is alive; false = dead or a recycled pid. */
+function ownerAlive(owner: LockOwner): boolean {
+  try {
+    process.kill(owner.pid, 0);
+  } catch (err) {
+    // EPERM = the process exists but is another user's — alive, never
+    // "take over" a process we can't inspect. ESRCH = dead.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+  // A live pid can still be a RECYCLED pid after a reboot: compare kernel
+  // start times. Old locks without pidStart get the benefit of the doubt.
+  if (owner.pidStart !== undefined) {
+    const now = processStartTime(owner.pid);
+    if (now !== undefined && now !== owner.pidStart) return false;
+  }
+  return true;
 }
 
 /** Read the lock; null = absent/unreadable, owner.alive reports pid state. */
@@ -53,8 +62,7 @@ export function inspectLock(stateDir: string): { owner: LockOwner; alive: boolea
   try {
     const owner = JSON.parse(readFileSync(file, "utf8")) as LockOwner;
     if (typeof owner.pid !== "number") return null;
-    const status = pidStatus(owner.pid);
-    return { owner, alive: status === "alive" };
+    return { owner, alive: ownerAlive(owner) };
   } catch {
     return null;
   }
@@ -71,7 +79,12 @@ export class MachineLock {
     const file = path.join(stateDir, LOCK_NAME);
     for (let attempt = 0; attempt < 5; attempt++) {
       const token = randomUUID();
-      const owner: LockOwner = { pid: process.pid, token, startedAt: new Date().toISOString() };
+      const owner: LockOwner = {
+        pid: process.pid,
+        token,
+        startedAt: new Date().toISOString(),
+        pidStart: processStartTime(process.pid),
+      };
       try {
         // O_EXCL: atomic create — two racing acquires cannot both succeed.
         await writeFile(file, JSON.stringify(owner, null, 2) + "\n", { flag: "wx" });

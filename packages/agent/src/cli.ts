@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --experimental-transform-types
 /**
  * raftd — CLI for the durable daemon.
  *
@@ -29,12 +29,15 @@ import type { AgentModelRef } from "./types.ts";
 
 const USAGE = `raftd — durable agent daemon (pi-durable)
 
-  create <name> [--model p/m] [--instructions "..."]   create agent + workspace
+  <agent> below accepts an agent name OR its agent-id.
+
+  create <name> [--model p/m] [--instructions "..."]
+         [--thinking minimal|low|medium|high] [--workspace <dirname>]
   list                                                all agents
   show <agent>                                        record + lifecycle
   lifecycle <agent>                                   projected lifecycle state
-  send <agent> <text...> [--no-wait] [--raw]          submit, wait, print answer
-  steer <agent> <text...>                             input into running turn
+  send <agent> <text...> [-m file] [--no-wait] [--raw] [--request-id id]
+  steer <agent> <text...> [--no-wait]                 input into running turn
   abort <agent> | stop <agent> | start <agent>
   resolve <agent> [note...]                           human outbox resolution
   reset <agent> [handoff...] | compact <agent> [...]
@@ -49,6 +52,7 @@ const USAGE = `raftd — durable agent daemon (pi-durable)
   serve [--port N] [--host H]                         daemon loop + web console (default :4777)
 
 --state <dir> or RAFTD_STATE (default ./.raftd); --model or RAFTD_MODEL.
+Serve env: RAFTD_PORT, RAFTD_HOST, RAFTD_KEY (api auth), RAFTD_COMPACT_IDLE_MS.
 `;
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
@@ -63,7 +67,7 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
       } else {
         const key = arg.slice(2);
         const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith("--") && !["no-wait", "raw", "workspace"].includes(key)) {
+        if (next !== undefined && !next.startsWith("--") && !["no-wait", "raw"].includes(key)) {
           flags[key] = next;
           i++;
         } else {
@@ -151,6 +155,9 @@ async function main(): Promise<number> {
       case "create": {
         const name = positional[1];
         if (!name) throw new Error("create needs a name");
+        if (flags.workspace !== undefined && typeof flags.workspace !== "string") {
+          throw new Error("create --workspace needs a directory name");
+        }
         const { record } = await daemon.createAgent({
           name,
           model: modelRef(flags.model as string) ?? modelRef(process.env.RAFTD_MODEL) ?? DEFAULT_MODEL,
@@ -293,7 +300,7 @@ async function main(): Promise<number> {
         break;
       }
       case "delete": {
-        await daemon.deleteAgent(needAgent(), { deleteWorkspace: flags.workspace === true });
+        await daemon.deleteAgent(needAgent(), { deleteWorkspace: flags.workspace !== undefined });
         console.log("deleted");
         break;
       }
@@ -380,7 +387,10 @@ async function runRemote(
     case "send":
     case "steer": {
       const r: any = await call("POST", `agents/${encodeURIComponent(id)}/messages`, {
-        text: bodyText, ...(cmd === "steer" ? { whenBusy: "steer" } : {}),
+        text: bodyText,
+        ...(cmd === "steer" ? { whenBusy: "steer" } : {}),
+        ...(flags["request-id"] ? { requestId: flags["request-id"] } : {}),
+        ...(flags.raw === true ? { raw: true } : {}),
       });
       console.log(`submission ${r.submissionId}`);
       if (flags["no-wait"] !== true) {
@@ -412,7 +422,7 @@ async function runRemote(
       for (const d of deliveries) console.log(JSON.stringify(d));
       return 0;
     }
-    case "delete": await call("DELETE", `agents/${encodeURIComponent(id)}${flags.workspace === true ? "?workspace=true" : ""}`); console.log("deleted"); return 0;
+    case "delete": await call("DELETE", `agents/${encodeURIComponent(id)}${flags.workspace !== undefined ? "?workspace=true" : ""}`); console.log("deleted"); return 0;
     case "usage": console.log(JSON.stringify((await state()).usage, null, 2)); return 0;
     case "inspect": console.log(JSON.stringify(await call("GET", "inspect"), null, 2)); return 0;
     case "main": {

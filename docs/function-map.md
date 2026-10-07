@@ -1,5 +1,9 @@
 # Raft daemon 功能全图（第一性拆解）
 
+> **更新 2026-10-07（第三轮）**：本表写于第一轮拆解；二三轮已把 #4 路由回环、#7 Web 控制台、
+> #9 提醒、#23 machineLock、#25 冷唤醒全部交付（见 NOTES.md「第二/三轮新增」+ e2e 报告）。
+> 下方状态列已同步更新。
+
 拆解对象：`reference/raft-daemon`（约 140 个文件 / 6.2 万行 TS）。按"谁在用、解决什么"分组，
 不按文件分组。每条标注本仓库移植状态：
 
@@ -15,12 +19,12 @@
 | 1 | 养一个长驻 agent | server 下发 `agent:start` → driver 拉起 CLI 进程 | **已有** | `create` → ownerless conversation，无进程 |
 | 2 | 给 agent 发消息拿回复 | `agent:deliver` → inbox/wake/busy 协调 → 进程 stdin | **已有** | `postMessage` + `whenBusy`（steer/followUp/reject），e2e 实测 |
 | 3 | agent 会干活（工具） | runtime 自带 CLI 工具 + managed MCP + raft CLI | **已有（部分）** | pi CodingTools 已接；managed MCP/raft CLI 工具面**缺失** |
-| 4 | agent 与 agent 对话 | 消息经 server 路由到目标 agent | **缺失** | 本版最大缺口：信封有 target 语义但没有路由回环 |
+| 4 | agent 与 agent 对话 | 消息经 server 路由到目标 agent | **已有** | `send_message` 工具→本人 outbox write-ahead→RoutingTransport→目标 postMessage（`route:<agent>:<seq>` 幂等），e2e 实测 |
 | 5 | 崩溃不丢活 | daemon 重启重连仍活着的 CLI 进程 | **超越** | 状态先行落盘，`kill -9` 后原地续跑，已实测 |
 | 6 | 忙时消息不丢 | parked wake / delivery debt / busy 协调器 | **已有** | `pi.inbox` + `whenBusy` 原生语义 |
-| 7 | 看 agent 在干嘛 | server 上 UI（不在本仓库） | **缺失** | 本版需自带界面：CLI 有，web 控制台要做 |
+| 7 | 看 agent 在干嘛 | server 上 UI（不在本仓库） | **已有** | `serve` 内嵌零构建 Web 控制台：agent/聊天/事件/收件箱/提醒/用量 |
 | 8 | 上下文管理 | wake recycle：缓存过期+大上下文→简报新会话 | **部分** | pi-durable 自带 compaction；简报式 recycle 缺失 |
-| 9 | 提醒/定时唤醒 | reminder app：到点 inbox 唤醒 agent | **缺失** | 可做：定时器→postMessage |
+| 9 | 提醒/定时唤醒 | reminder app：到点 inbox 唤醒 agent | **已有** | durable 定时器（落盘重启不丢）→ 到点以 systemNotice 投递；活提醒即时布防 |
 | 10 | 工作区隔离与种子内容 | workspaces + onboarding seed（MEMORY.md 等） | **已有** | 容器校验逐行移植，种子已做 |
 | 11 | 消息信封/防伪造 | `[target=.. msg=..] @sender: body` + 续行缩进 | **已有** | runtimeInput.ts |
 | 12 | 迁移（换机器搬 agent） | 工作区打包→对象存储→目标导入 | **不适用 v1** | pi-durable 单机 storage；等价物 = 复制 stateDir |
@@ -39,7 +43,7 @@
 | 20 | transcript 落盘 | sessionTranscriptReader | **已有** | transcripts/*.jsonl |
 | 21 | 启动失败熔断 | spawn-fail backoff / decision error window | **缺失** | 可对 err 计数入 cooldown |
 | 22 | 投递可见性账本 | agentVisibleDeliveryLedger：agent 到底"看见"了哪条消息 | **部分** | durable entry 天然可见性更强；显式账本缺失 |
-| 23 | machineLock 防双开 | 锁文件+token 防两个 daemon 抢一台机 | **缺失** | 需要：双开同 stateDir 应拒绝 |
+| 23 | machineLock 防双开 | 锁文件+token 防两个 daemon 抢一台机 | **已有** | `raftd.lock`（pid+token+内核启动时间原子锁）；serve 不可达时 CLI 拒开第二 Harness |
 | 24 | 孤儿进程回收 | daemonOrphanReaper SIGKILL 漏网子进程 | **不适用** | 没有子进程 |
 
 ## 三、运维面（跑在客户机器上要管什么）
@@ -73,11 +77,11 @@
 跑起来，开浏览器就能用。核心卖点必须是原版做不到的：**kill -9 之后接着干活**
 （原版的崩溃恢复是重连进程，本版是状态先行）。
 
-必须补的最小闭环（按价值排序）：
-1. **Web 控制台**（#7）——没有界面就不是产品
-2. **agent↔agent 路由回环**（#4）——群聊是 raft 的灵魂
-3. **提醒/定时唤醒**（#9）——"长驻"体验的关键差异
-4. **machineLock + cold-idle + 限速**（#23/25/26）——锁和冷唤醒回收已交付；限速单机低优先
+当初定的"必须补的最小闭环"现已全部交付（#7 控制台、#4 路由、#9 提醒、#23 锁、#25 冷唤醒）：
+1. **Web 控制台**（#7）✅ 已交付
+2. **agent↔agent 路由回环**（#4）✅ 已交付
+3. **提醒/定时唤醒**（#9）✅ 已交付
+4. **machineLock + cold-idle**（#23/25）✅ 已交付；限速（#26）单机低优先，仍缺
 5. **managed 工具面**（#34）——agent 能 `raft message send` 才形成闭环
 6. **cold-wake 简报 recycle**（#8）——成本优化，原版 RFC 070 的精华
 

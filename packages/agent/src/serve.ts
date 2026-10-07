@@ -147,12 +147,21 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
         if (parts.length >= 3) {
           const id = decodeURIComponent(parts[2]);
           if (req.method === "POST" && parts[3] === "messages") {
-            const body = (await readBody(req)) as { text?: string; whenBusy?: "steer" | "followUp" | "reject" };
+            const body = (await readBody(req)) as {
+              text?: string;
+              whenBusy?: "steer" | "followUp" | "reject";
+              requestId?: string;
+              raw?: boolean;
+            };
             if (!body.text) return json(res, 400, { error: "text required" });
             if (body.whenBusy !== undefined && !["steer", "followUp", "reject"].includes(body.whenBusy)) {
               return json(res, 400, { error: `whenBusy must be steer|followUp|reject (got "${body.whenBusy}")` });
             }
-            const r = await daemon.postMessage(id, body.text, { whenBusy: body.whenBusy });
+            const r = await daemon.postMessage(id, body.text, {
+              whenBusy: body.whenBusy,
+              requestId: body.requestId,
+              raw: body.raw === true,
+            });
             json(res, 202, r);
             return;
           }

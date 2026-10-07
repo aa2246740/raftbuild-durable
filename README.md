@@ -9,14 +9,20 @@ Raft daemon 靠监管外部 CLI 进程做长驻会话；raftd 用
 
 ## 一分钟上手
 
+需要 **Node ≥ 22.7**（建议 24）+ **pnpm ≥ 10**（`corepack enable` 一次即可）。
+
 ```bash
 pnpm install
 export ZAI_CODING_CN_API_KEY=...        # GLM coding plan；也可用 $zhipu / MINIMAX_CN_API_KEY
 
 cd packages/agent
-pnpm cli serve                         # daemon + 路由 + 提醒 + Web 控制台一次起来
+pnpm cli serve                         # daemon + 路由 + 提醒 + Web 控制台一次起来（前台常驻）
 # → 打开 http://127.0.0.1:4777
 ```
+
+serve 是前台进程——**另开一个终端**（同一个 packages/agent 目录下）再敲后面的命令；
+跨目录运行请先 `--state <dir>` 指到同一个状态目录。文档里的 `raftd` = `pnpm cli`
+=`pnpm raftd`（真可执行：package bin + `./src/cli.ts` 带 shebang 可直接跑）。
 
 控制台里：建 agent、发消息、看它实时跑工具、收它发回 "main" 的汇报、挂提醒。
 命令行是同一份能力的薄客户端——serve 活着时自动走 HTTP，不会双开 storage：
@@ -41,9 +47,11 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 - **溢出 fail-closed**：outbox 满 128 先丢最老 `turn_completed`，没得丢就标记 unreliable，人工 `resolve` 才恢复
 - **双开拒绝**：`raftd.lock`（pid+token）防止第二个 serve 抢 storage；CLI 自动降级成 HTTP 薄客户端
 - **工作区沙箱**：每个 agent 的工作目录被约束在 `workspaces/` 下一级
-- **可打断**：`steer` 往运行中的轮次里插话；`whenBusy` 三档（steer/followUp/排队）
+- **可打断**：`steer` 往运行中的轮次里插话；`whenBusy` = `steer`（插话）/ `followUp`（跑完此轮接着跑）/ `reject`（忙则拒绝）；不给=排队
 - **冷唤醒回收**：agent 静默超过阈值，下条消息先自动压缩上下文再跑——长驻不费 token
   （serve 默认 30m，`RAFTD_COMPACT_IDLE_MS=0` 关闭，e2e phase K 实测）
+- **联网安全**：`--host 0.0.0.0` 时必须设 `RAFTD_KEY`——之后所有 /api/* 要 Bearer 认证；
+  不设就打警告（控制台在 URL 上加 `?key=` 或在页面提示框里输）
 
 ## 布局
 
@@ -66,18 +74,35 @@ pnpm typecheck && pnpm e2e    # 需要模型 key；报告写到 e2e/report.md
 
 当前 e2e 覆盖：真实 GLM 问答 / bash 写文件 / SIGKILL 原地复活 / steer 插队 /
 outbox 十项不变量 / agent 互发消息 / 收件箱 / 弹回 / 提醒触发 / 锁与双开 /
-serve HTTP+控制台+薄 CLI / 冷唤醒压缩。
+serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 第三轮加固回归（活提醒触发、stopped 目标永久弹回、
+坏 transcript 行容忍、锁竞争、stale port 拒开、API 400/404/409）。
 
 ## 常见问题
 
 - **端口被占**：`pnpm cli serve --port 4999` 换个端口。
 - **"state dir already locked"**：上一任 serve 还活着（看 pid），或者它非正常死亡留下了
   `raftd.lock`——确认进程真死了就删掉 state 目录里的 `raftd.lock` 再启动。
-- **agent 不回答 / `no_model`**：没设 key。`export ZAI_CODING_CN_API_KEY=...`
-  （或 `export zhipu=...`），重启 serve。
-- **状态在哪**：`--state` 指定目录（默认 `./.raftd`），里面有 SQLite + workspaces +
-  transcripts + deliveries。备份=拷目录；删除=连目录一起 `rm -rf`。
-- **CLI 报 `no remote path`**：serve 活着但这条命令只能本地跑——先停 serve 或直接开新 stateDir。
+- **agent 不回答 / `unanswered: no_model`**：一个 provider key 都没读到。
+  认这些变量名：`ZAI_CODING_CN_API_KEY` / `zhipu` / `ZAI_API_KEY` /
+  `MINIMAX_CN_API_KEY` / `MINIMAX_CN` / `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` /
+  `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`——export 任一后重启 serve
+  （启动时 0 个 provider 会直接打 warning）。
+- **状态在哪**：`--state` 指定目录（默认 `./.raftd`），备份=拷目录；删除=连目录一起 `rm -rf`。布局：
+  `session.sqlite`（会话+outbox+提醒 全 durable）、`workspaces/<agent>/`（沙箱工作区）、
+  `transcripts/<agent>.events.jsonl`（事件流水）、`.deliveries/`（送达账本，`pnpm cli deliveries`）、
+  `raftd.lock`/`raftd.port`（单实例锁 / 薄客户端发现文件）。
+- **`<agent>` 参数**：名字和 agent-id 都行。
+- **其余命令**：`show / deliveries / stop / start / abort / resolve / reset / compact / reminders`
+  全在 `pnpm cli help` 里。
+- **CLI 报 "Refusing to open a second local Harness"**：有 `raftd.port` 说明曾有 serve
+  占着这份 state。serve 活着→CLI 自动走 HTTP 不用管；serve 死了→先 `pnpm cli serve` 重启，
+  或确认没进程在跑后删掉 `raftd.port`（保留该文件是防双开写坏 SQLite）。
+
+## 上云
+
+`deploy/` 是给 Fly.io 准备的完整包裹：`app/main.py` 是个 FastAPI 反代（起 `raftd serve`、
+`RAFTD_KEY` 鉴权、`POST /setup/env` 持久化模型 key），`Dockerfile` 一个镜像装 Node24+pnpm+全仓库。
+`fly deploy` 或直接 Devin「部署后端」。状态全在 `/data` 卷里，机器回收不丢。
 
 ## 明确不做的
 

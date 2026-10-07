@@ -29,7 +29,7 @@
 │  │    mainInbox/timers                    │          │
 │  │  · CodingTools + send_message 工具      │          │
 │  └──────────────────────────────────────┘          │
-│  SQLite stateDir (agents.sqlite)                   │
+│  SQLite stateDir (session.sqlite)                  │
 └────────────────────────────────────────────────────┘
 raftd CLI → 同一份 stateDir
 ```
@@ -56,12 +56,12 @@ raftd CLI → 同一份 stateDir
 - **控制台内置**：原版 UI 在 server 端
 
 ## 交付清单（Done 的定义）
-- [ ] `pnpm cli serve` 起全套（路由+提醒+HTTP+UI+锁）
-- [ ] 浏览器控制台：agent 列表/创建/发消息/看回复/事件流/outbox/生命周期
-- [ ] agent↔agent 消息实测（工具调用触发真实投递）
-- [ ] 提醒到点唤醒实测
-- [ ] 双开拒绝实测（machineLock）
-- [ ] e2e 全绿（含新 phase），report.md 更新
-- [ ] README 面向客户重写（安装/启动/使用）
-- [ ] PR 开出来
-- [ ] 部署到云（能上到什么算什么，如实报告）
+- [x] `pnpm cli serve` 起全套（路由+提醒+HTTP+UI+锁）
+- [x] 浏览器控制台：agent 列表/创建/发消息/看回复/事件流/outbox/生命周期
+- [x] agent↔agent 消息实测（工具调用触发真实投递）
+- [x] 提醒到点唤醒实测
+- [x] 双开拒绝实测（machineLock）
+- [x] e2e 全绿（含新 phase），report.md 更新
+- [x] README 面向客户重写（安装/启动/使用）
+- [x] PR 开出来（#1）
+- [ ] 部署到云（deploy/ 已备好，待批准后上线）
