@@ -66,6 +66,17 @@ pnpm typecheck && pnpm e2e    # 需要模型 key；报告写到 e2e/report.md
 outbox 十项不变量 / agent 互发消息 / 收件箱 / 弹回 / 提醒触发 / 锁与双开 /
 serve HTTP+控制台+薄 CLI。
 
+## 常见问题
+
+- **端口被占**：`pnpm cli serve --port 4999` 换个端口。
+- **"state dir already locked"**：上一任 serve 还活着（看 pid），或者它非正常死亡留下了
+  `raftd.lock`——确认进程真死了就删掉 state 目录里的 `raftd.lock` 再启动。
+- **agent 不回答 / `no_model`**：没设 key。`export ZAI_CODING_CN_API_KEY=...`
+  （或 `export zhipu=...`），重启 serve。
+- **状态在哪**：`--state` 指定目录（默认 `./.raftd`），里面有 SQLite + workspaces +
+  transcripts + deliveries。备份=拷目录；删除=连目录一起 `rm -rf`。
+- **CLI 报 `no remote path`**：serve 活着但这条命令只能本地跑——先停 serve 或直接开新 stateDir。
+
 ## 明确不做的
 
 多机接管（pi-durable 一份 storage 只能一个 Harness 持有——结构性边界）、

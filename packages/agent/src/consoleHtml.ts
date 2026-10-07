@@ -111,8 +111,18 @@ let sel = null, state = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
+let KEY = localStorage.raftdKey || '';
+if (new URLSearchParams(location.search).get('key')) {
+  KEY = new URLSearchParams(location.search).get('key');
+  localStorage.raftdKey = KEY;
+  history.replaceState(null, '', location.pathname);
+}
 async function api(path, method, body) {
-  const r = await fetch('/api/' + path, { method: method || 'GET', headers: {'content-type':'application/json'}, body: body ? JSON.stringify(body) : undefined });
+  const r = await fetch('/api/' + path, { method: method || 'GET', headers: {'content-type':'application/json', ...(KEY ? {authorization:'Bearer '+KEY} : {})}, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) {
+    const k = prompt('This raftd is private. Enter the admin key (from deploy logs or $RAFTD_STATE/admin-key):');
+    if (k) { localStorage.raftdKey = k; KEY = k; return api(path, method, body); }
+  }
   if (!r.ok) throw new Error((await r.json()).error || r.statusText);
   return r.json();
 }
@@ -188,7 +198,7 @@ async function setReminder() {
   try { await api('reminders', 'POST', {agent, when, text}); $('rm-when').value=''; $('rm-text').value=''; refresh(); }
   catch(e){ alert(e.message); }
 }
-async function delReminder(id){ await fetch('/api/reminders/'+id, {method:'DELETE'}); refresh(); }
+async function delReminder(id){ await api('reminders/'+id, 'DELETE'); refresh(); }
 
 refresh();
 setInterval(refresh, 3000);
