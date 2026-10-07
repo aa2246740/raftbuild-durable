@@ -67,6 +67,51 @@ export class OutboxError extends Error {
 
 export type OutboxAppendResult = "appended" | "dropped_turn_completed" | "unreliable";
 
+/**
+ * Shared doc-level append: dedupe ring + entry push + cap drop/fail-closed.
+ * Used by `AgentOutbox.append()` and by tools writing route frames inside
+ * their own `api.commit` — same discipline either way.
+ */
+export function appendToOutboxDoc(
+  doc: OutboxDocState,
+  frame: OutboxFrame,
+  dedupeKey?: string,
+): { clientSeq: number; result: OutboxAppendResult } | { duplicate: true } {
+  if (dedupeKey !== undefined) {
+    if (doc.producedSubmissionIds.includes(dedupeKey)) return { duplicate: true };
+    doc.producedSubmissionIds.push(dedupeKey);
+    if (doc.producedSubmissionIds.length > 256) {
+      doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 256);
+    }
+  }
+  const clientSeq = doc.nextClientSeq++;
+  doc.entries.push({
+    clientSeq,
+    frame,
+    enqueuedAt: new Date().toISOString(),
+    inFlight: false,
+    attempts: 0,
+    lastAttemptAt: null,
+  });
+  let result: OutboxAppendResult = "appended";
+  if (doc.entries.length > OUTBOX_NORMAL_CAP) {
+    const victimIndex = doc.entries.findIndex(
+      // The newly appended frame is never a drop victim — dropping the
+      // fresh evidence to make room for itself defeats the write-ahead.
+      (e) => !e.inFlight && e.clientSeq !== clientSeq && isTurnCompleted(e),
+    );
+    if (victimIndex >= 0) {
+      doc.entries.splice(victimIndex, 1);
+      result = "dropped_turn_completed";
+    } else {
+      // Fail closed: a throw aborts the commit — no entry was added and
+      // no marker could be lost half-written.
+      throw new OutboxError("outbox overflow: refused to drop non-turn_completed evidence", "overflow");
+    }
+  }
+  return { clientSeq, result };
+}
+
 function isTurnCompleted(entry: OutboxDocEntry): boolean {
   const frame = entry.frame;
   return frame.type === "agent:runtime:outcome" && frame.outcome.kind === "turn_completed";
@@ -121,41 +166,7 @@ export class AgentOutbox {
         if (doc.unreliable) {
           throw new OutboxError(`agent ${this.agentId} outbox is unreliable since ${doc.unreliable.since}`, "unreliable");
         }
-        if (dedupeKey !== undefined) {
-          if (doc.producedSubmissionIds.includes(dedupeKey)) return { duplicate: true };
-          doc.producedSubmissionIds.push(dedupeKey);
-          if (doc.producedSubmissionIds.length > 256) {
-            doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 256);
-          }
-        }
-        const clientSeq = doc.nextClientSeq++;
-        const entry: OutboxDocEntry = {
-          clientSeq,
-          frame,
-          enqueuedAt: new Date().toISOString(),
-          inFlight: false,
-          attempts: 0,
-          lastAttemptAt: null,
-        };
-        let result: OutboxAppendResult = "appended";
-        doc.entries.push(entry);
-        if (doc.entries.length > OUTBOX_NORMAL_CAP) {
-          const victimIndex = doc.entries.findIndex(
-            // The newly appended frame is never a drop victim — dropping the
-            // fresh evidence to make room for itself defeats the write-ahead.
-            (e) => !e.inFlight && e.clientSeq !== clientSeq && isTurnCompleted(e),
-          );
-          if (victimIndex >= 0) {
-            doc.entries.splice(victimIndex, 1);
-            result = "dropped_turn_completed";
-          } else {
-            // Fail closed: a throw aborts the commit — no entry was added and
-            // no marker could be lost half-written. The unreliable marker is
-            // committed separately by the caller's catch.
-            throw new OutboxError("outbox overflow: refused to drop non-turn_completed evidence", "overflow");
-          }
-        }
-        return { clientSeq, result };
+        return appendToOutboxDoc(doc, frame, dedupeKey);
       }, this.ctx);
     } catch (err) {
       const benignClose = err instanceof Error && /session is closed/i.test(err.message);

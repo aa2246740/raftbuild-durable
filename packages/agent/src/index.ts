@@ -51,3 +51,9 @@ export {
 } from "./diagnostics.ts";
 export { JsonlDeliveryTransport, ScriptedTransport, FlakyTransport, type OutboxTransport, type OutboxEnvelope } from "./transport.ts";
 export { RaftAgentExtension, RAFT_AGENT_EXTENSION_NAME } from "./extension.ts";
+export { MessagingExtension, SendMessageTool, SEND_MESSAGE_TOOL } from "./messaging.ts";
+export { RoutingTransport, MainInboxDoc, type AgentMessageFrame, type MainInboxEntry, type MainInboxState } from "./router.ts";
+export { ReminderService, RemindersDoc, parseWhen, type Reminder, type RemindersState } from "./reminders.ts";
+export { MachineLock, MachineLockError } from "./machineLock.ts";
+export { startServer, type ServeOptions } from "./serve.ts";
+export { appendToOutboxDoc } from "./outbox.ts";

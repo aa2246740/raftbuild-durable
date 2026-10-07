@@ -22,6 +22,9 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { DurableDaemon } from "./daemon.ts";
+import { MachineLock } from "./machineLock.ts";
+import { ReminderService } from "./reminders.ts";
+import { startServer } from "./serve.ts";
 import type { AgentModelRef } from "./types.ts";
 
 const USAGE = `raftd — durable agent daemon (pi-durable)
@@ -38,9 +41,12 @@ const USAGE = `raftd — durable agent daemon (pi-durable)
   events <agent>                                      normalized transcript
   outbox <agent>                                      outbox doc JSON
   deliveries [agent]                                  delivered-frames ledger
+  main                                                operator inbox (agent → main)
+  remind <agent> <when> <text...>                     durable reminder ("in 30m"/"every 1h"/"at 14:30")
+  reminders                                           pending reminders
   delete <agent> [--workspace]
   usage | inspect
-  serve                                               resume; run pumps until SIGINT
+  serve [--port N] [--host H]                         daemon loop + web console (default :4777)
 
 --state <dir> or RAFTD_STATE (default ./.raftd); --model or RAFTD_MODEL.
 `;
@@ -89,6 +95,18 @@ async function main(): Promise<number> {
   }
 
   const stateDir = (flags.state as string) ?? process.env.RAFTD_STATE ?? ".raftd";
+
+  // If `raftd serve` is live (port file + reachable API), act as a thin client
+  // — opening the storage here would mean two Harnesses on one SQLite.
+  if (cmd !== "serve") {
+    const portFile = path.join(stateDir, "raftd.port");
+    if (existsSync(portFile)) {
+      const addr = (await readFile(portFile, "utf8")).trim();
+      const code = await runRemote(`http://${addr}`, cmd, positional, flags).catch(() => null);
+      if (code !== null) return code;
+    }
+  }
+
   const daemon = await DurableDaemon.open({
     stateDir,
     providers: "env",
@@ -97,8 +115,9 @@ async function main(): Promise<number> {
   const shutdown = async () => {
     await daemon.close();
   };
-  process.on("SIGINT", () => void shutdown().then(() => process.exit(0)));
-  process.on("SIGTERM", () => void shutdown().then(() => process.exit(0)));
+  const defaultSigHandler = () => void shutdown().then(() => process.exit(0));
+  process.on("SIGINT", defaultSigHandler);
+  process.on("SIGTERM", defaultSigHandler);
 
   const needAgent = () => {
     const id = positional[1];
@@ -232,6 +251,27 @@ async function main(): Promise<number> {
         }
         break;
       }
+      case "main": {
+        const entries = await daemon.mainInbox();
+        if (entries.length === 0) console.log("(empty)");
+        for (const e of entries) console.log(`${e.at}  @${e.fromName}: ${e.text}`);
+        break;
+      }
+      case "remind": {
+        const agent = positional[1];
+        const when = positional[2];
+        const body = positional.slice(3).join(" ");
+        if (!agent || !when || !body) throw new Error('usage: remind <agent> <when> <text...> (when: "in 30m" / "every 1h" / "at 14:30" / ISO)');
+        const r = await daemon.remind(agent, when, body);
+        console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt}${r.everyMs ? " (repeats)" : ""}`);
+        break;
+      }
+      case "reminders": {
+        const timers = await daemon.listReminders();
+        if (timers.length === 0) console.log("(no pending reminders)");
+        for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt}${t.everyMs ? `  every=${t.everyMs}ms` : ""}  "${t.text}"`);
+        break;
+      }
       case "delete": {
         await daemon.deleteAgent(needAgent(), { deleteWorkspace: flags.workspace === true });
         console.log("deleted");
@@ -246,10 +286,27 @@ async function main(): Promise<number> {
         break;
       }
       case "serve": {
+        const lock = await MachineLock.acquire(daemon.stateDir);
+        const reminders = new ReminderService(daemon);
         await daemon.resume();
+        await reminders.start();
+        const port = Number(flags.port ?? process.env.RAFTD_PORT ?? 4777);
+        const host = (flags.host as string) ?? process.env.RAFTD_HOST ?? "127.0.0.1";
+        const server = await startServer(daemon, { host, port });
         const agents = await daemon.listAgents();
-        console.log(`serve: ${agents.length} agent(s), state=${daemon.stateDir}`);
-        for (const a of agents) console.log(`  ${a.agentId} ${a.name}`);
+        console.log(`raftd serving — console http://${host}:${port}  state=${daemon.stateDir}`);
+        console.log(`  ${agents.length} agent(s); ${(await daemon.listReminders()).length} reminder(s) armed`);
+        const exit = async () => {
+          reminders.stop();
+          server.close();
+          await shutdown();
+          await lock.release();
+          process.exit(0);
+        };
+        process.off("SIGINT", defaultSigHandler);
+        process.off("SIGTERM", defaultSigHandler);
+        process.on("SIGINT", () => void exit());
+        process.on("SIGTERM", () => void exit());
         await new Promise(() => {});
         break;
       }
@@ -261,6 +318,98 @@ async function main(): Promise<number> {
     if (cmd !== "serve") await shutdown();
   }
   return 0;
+}
+
+/** Run a command against a live `serve` via its HTTP API. Throws if unreachable. */
+async function runRemote(
+  base: string,
+  cmd: string,
+  positional: string[],
+  flags: Record<string, string | boolean>,
+): Promise<number> {
+  const call = async (method: string, p: string, body?: unknown) => {
+    const r = await fetch(base + "/api/" + p, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(body !== undefined || p === "state" ? 30_000 : 120_000),
+    });
+    if (!r.ok) throw new Error(`remote ${method} ${p}: ${(await r.json().catch(() => ({}))).error ?? r.statusText}`);
+    return r.json();
+  };
+  const id = positional[1];
+  const bodyText = positional.slice(2).join(" ");
+  const state = async () => (await call("GET", "state")) as any;
+
+  switch (cmd) {
+    case "create": {
+      const rec: any = await call("POST", "agents", {
+        name: positional[1], instructions: flags.instructions,
+        ...(flags.model ? { model: flags.model } : {}),
+      });
+      console.log(`created ${rec.agentId} (${rec.name})`);
+      return 0;
+    }
+    case "list": {
+      const s = await state();
+      const lcs = Object.fromEntries(s.lifecycles.map((l: any) => [l.agentId, l.kind]));
+      if (!s.agents.length) console.log("(no agents)");
+      for (const a of s.agents) console.log(`${a.agentId}  ${a.name}  ${a.model.provider}/${a.model.modelId}  ${lcs[a.agentId] ?? "?"}`);
+      return 0;
+    }
+    case "send":
+    case "steer": {
+      const r: any = await call("POST", `agents/${encodeURIComponent(id)}/messages`, {
+        text: bodyText, ...(cmd === "steer" ? { whenBusy: "steer" } : {}),
+      });
+      console.log(`submission ${r.submissionId}`);
+      if (flags["no-wait"] !== true) {
+        const a: any = await call("GET", `agents/${encodeURIComponent(id)}/answer?submissionId=${encodeURIComponent(r.submissionId)}`);
+        console.log(a.status === "done" ? (a.text ?? "(empty)") : `unanswered: ${a.reason ?? "?"}`);
+        if (a.status !== "done") return 2;
+      }
+      return 0;
+    }
+    case "abort": case "stop": case "start": case "resolve": case "compact": case "reset":
+      await call("POST", `agents/${encodeURIComponent(id)}/${cmd}`, { note: bodyText || undefined, instructions: bodyText || undefined, handoff: bodyText || undefined });
+      console.log(`${cmd} ok`);
+      return 0;
+    case "lifecycle": console.log(JSON.stringify(await call("GET", `agents/${encodeURIComponent(id)}/lifecycle`), null, 2)); return 0;
+    case "show": {
+      const s = await state();
+      const rec = s.agents.find((a: any) => a.agentId === id || a.name === id);
+      console.log(JSON.stringify({ record: rec, lifecycle: await call("GET", `agents/${encodeURIComponent(rec?.agentId ?? id)}/lifecycle`) }, null, 2));
+      return 0;
+    }
+    case "events": {
+      const { events }: any = await call("GET", `agents/${encodeURIComponent(id)}/events?tail=500`);
+      for (const e of events) console.log(JSON.stringify(e));
+      return 0;
+    }
+    case "outbox": console.log(JSON.stringify(await call("GET", `agents/${encodeURIComponent(id)}/outbox`), null, 2)); return 0;
+    case "delete": await call("DELETE", `agents/${encodeURIComponent(id)}${flags.workspace === true ? "?workspace=true" : ""}`); console.log("deleted"); return 0;
+    case "usage": console.log(JSON.stringify((await state()).usage, null, 2)); return 0;
+    case "inspect": console.log(JSON.stringify(await call("GET", "inspect"), null, 2)); return 0;
+    case "main": {
+      const box = (await state()).mainInbox;
+      if (!box.length) console.log("(empty)");
+      for (const e of box) console.log(`${e.at}  @${e.fromName}: ${e.text}`);
+      return 0;
+    }
+    case "remind": {
+      const r: any = await call("POST", "reminders", { agent: id, when: positional[2], text: positional.slice(3).join(" ") });
+      console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt}`);
+      return 0;
+    }
+    case "reminders": {
+      const timers = (await state()).reminders;
+      if (!timers.length) console.log("(no pending reminders)");
+      for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt}  "${t.text}"`);
+      return 0;
+    }
+    default:
+      throw new Error(`no remote path for ${cmd}`);
+  }
 }
 
 main()

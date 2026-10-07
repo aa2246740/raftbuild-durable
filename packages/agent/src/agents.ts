@@ -19,6 +19,15 @@ export const AgentsDoc = defineDoc<AgentsDocState>({
 /** Reverse binding written into each conversation at creation (`init`). */
 export const AgentBindingDocKind = "raft.agentBinding";
 
+export const AgentBindingDoc = defineDoc<{ agentId: string }>({
+  kind: AgentBindingDocKind,
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ agentId: "" }),
+});
+
 export class AgentRegistryError extends Error {
   constructor(
     message: string,

@@ -27,8 +27,11 @@ import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   DurableDaemon,
+  MachineLock,
+  MachineLockError,
   OutboxDoc,
   OutboxError,
+  ReminderService,
   ScriptedTransport,
   FlakyTransport,
   resolveWorkspaceDirectoryPath,
@@ -423,6 +426,190 @@ async function phaseFG(stateDir: string) {
   check("envelope + reply hint present", wrapped.startsWith("New message received:") && wrapped.includes(RESPONSE_TARGET_HINT));
 }
 
+// ── H: agent↔agent routing + operator inbox + bounce ────────────────────────
+
+async function phaseH(stateDir: string, alphaId: string) {
+  phase("H — send_message routing (agent→agent, agent→main, bounce)");
+  const daemon = await DurableDaemon.open({ stateDir, providers: "env", defaultModel: MODEL });
+  try {
+    await daemon.resume();
+    const { record: beta } = await daemon.createAgent({
+      name: "beta",
+      model: MODEL,
+      instructions: "You are a verification agent. Follow instructions literally and concisely.",
+    });
+
+    // Submissions carry the router's requestId — the durable proof of admission.
+    const submissionWithRequestId = async (agentId: string, prefix: string) =>
+      (await daemon.submissions(agentId)).find((s) => s.requestId?.startsWith(prefix));
+
+    // 1) alpha → beta, end to end through the real model.
+    await daemon.postMessage(
+      alphaId,
+      'Use the send_message tool exactly once with target "beta" and text "HELLO-FROM-ALPHA". Then reply DONE.',
+      { raw: true },
+    );
+    const routed = await waitFor(
+      "routed submission on beta",
+      async () => (await submissionWithRequestId(beta.agentId, `route:${alphaId}:`)) !== undefined,
+      180_000,
+      2_000,
+    );
+    check("alpha→beta message routed (durable submission on beta)", routed);
+    const routeSub = routed ? await submissionWithRequestId(beta.agentId, `route:${alphaId}:`) : undefined;
+    check("routed submission settled", routeSub !== undefined && routeSub.status === "done", routeSub?.status ?? "-");
+
+    // 2) beta → main (operator inbox).
+    await daemon.postMessage(
+      beta.agentId,
+      'Use the send_message tool exactly once with target "main" and text "B-REPORT-OK". Then reply DONE.',
+      { raw: true },
+    );
+    const gotMain = await waitFor(
+      "mainInbox entry",
+      async () => (await daemon.mainInbox()).some((m) => m.text.includes("B-REPORT-OK")),
+      180_000,
+      2_000,
+    );
+    check("beta→main landed in operator inbox", gotMain);
+    const entry = (await daemon.mainInbox()).find((m) => m.text.includes("B-REPORT-OK"));
+    check("inbox entry names the sender", entry?.fromName === "beta", entry?.fromName ?? "-");
+
+    // 3) unknown target bounces back to the sender.
+    await daemon.postMessage(
+      alphaId,
+      'Use the send_message tool exactly once with target "ghost-agent" and text "VOID". Then reply DONE.',
+      { raw: true },
+    );
+    const bounced = await waitFor(
+      "bounce submission on alpha",
+      async () => (await submissionWithRequestId(alphaId, `route-bounce:${alphaId}:`)) !== undefined,
+      180_000,
+      2_000,
+    );
+    check("bounce notice returned to sender", bounced);
+    return { betaId: beta.agentId };
+  } finally {
+    await daemon.close();
+  }
+}
+
+// ── I: durable reminders ────────────────────────────────────────────────────
+
+async function phaseI(stateDir: string, agentId: string) {
+  phase("I — durable reminder fires as a system notice");
+  const daemon = await DurableDaemon.open({ stateDir, providers: "env", defaultModel: MODEL });
+  const svc = new ReminderService(daemon);
+  try {
+    await daemon.resume();
+    const r = await daemon.remind(agentId, "in 5s", "check-in CHIME-42");
+    check("reminder committed durably", (await daemon.listReminders()).some((t) => t.id === r.id), r.id);
+    await svc.start();
+    check(
+      "reminder fired into the conversation",
+      await waitFor("transcript saw CHIME-42", () => transcriptHas(stateDir, agentId, "CHIME-42"), 60_000, 500),
+    );
+    check("one-shot removed after firing", !(await daemon.listReminders()).some((t) => t.id === r.id));
+  } finally {
+    svc.stop();
+    await daemon.close();
+  }
+}
+
+// ── J: machine lock + serve HTTP + thin-CLI ─────────────────────────────────
+
+function runCli(stateDir: string, args: string[]): Promise<{ code: number | null; out: string }> {
+  return new Promise((resolve) => {
+    const p = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), ...args], {
+      env: { ...process.env, RAFTD_STATE: stateDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    p.stdout.on("data", (d) => (out += String(d)));
+    p.stderr.on("data", (d) => (out += String(d)));
+    p.once("exit", (code) => resolve({ code, out }));
+  });
+}
+
+async function phaseJ(stateDir: string, alphaId: string) {
+  phase("J — machineLock, raftd serve, console, thin-CLI remote");
+  // 1) Lock semantics in-process.
+  const lock = await MachineLock.acquire(stateDir);
+  check("first lock acquires", existsSync(path.join(stateDir, "raftd.lock")));
+  let secondThrew = false;
+  try {
+    await MachineLock.acquire(stateDir);
+  } catch (err) {
+    secondThrew = err instanceof MachineLockError;
+  }
+  check("second acquire refused while live", secondThrew);
+
+  // 2) A second `serve` process refuses to start while the lock is held.
+  const dup = await runCli(stateDir, ["serve", "--port", "4899"]);
+  check(
+    "double serve refused (exit!=0, lock error)",
+    dup.code !== 0 && /already locked|already running|MachineLock/i.test(dup.out),
+    dup.out.trim().split("\n").pop()?.slice(0, 140) ?? "",
+  );
+
+  // 3) Real serve: lock + HTTP + console + thin-CLI + API round trip.
+  await lock.release();
+  const serve = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--port", "4888"], {
+    env: { ...process.env, RAFTD_STATE: stateDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let serveOut = "";
+  serve.stdout.on("data", (d) => (serveOut += String(d)));
+  serve.stderr.on("data", (d) => (serveOut += String(d)));
+  try {
+    const up = await waitFor("console responds", async () => {
+      try {
+        return (await fetch("http://127.0.0.1:4888/api/state")).ok;
+      } catch {
+        return false;
+      }
+    }, 30_000, 500);
+    if (!check("serve came up", up, serveOut.trim().slice(0, 200))) return;
+
+    const st = (await (await fetch("http://127.0.0.1:4888/api/state")).json()) as { agents: { agentId: string }[] };
+    check("/api/state lists the agents", st.agents.some((a) => a.agentId === alphaId), `${st.agents.length} agents`);
+
+    const html = await (await fetch("http://127.0.0.1:4888/")).text();
+    check("console HTML served", html.includes("raftd") && html.includes("<script") && html.includes("New agent"));
+
+    // Thin-CLI over the port file.
+    const remote = await runCli(stateDir, ["list"]);
+    check("`raftd list` spoke to the live serve", remote.code === 0 && remote.out.includes("alpha"), remote.out.trim().slice(0, 160));
+
+    // Full API round trip on a fresh agent.
+    const gamma: { agentId: string } = await (
+      await fetch("http://127.0.0.1:4888/api/agents", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "gamma" }),
+      })
+    ).json();
+    check("agent created over HTTP", !!gamma.agentId, gamma.agentId);
+    const sub: { submissionId: string } = await (
+      await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: 'Reply with exactly the single word "READY".' }),
+      })
+    ).json();
+    const answer = (await (await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/answer?submissionId=${sub.submissionId}`)).json()) as {
+      status: string;
+      text?: string;
+    };
+    check("HTTP round trip answered", answer.status === "done" && /READY/i.test(answer.text ?? ""), (answer.text ?? answer.status).slice(0, 80));
+  } finally {
+    serve.kill("SIGTERM");
+    await Promise.race([new Promise((r) => serve.once("exit", r)), sleep(15_000)]);
+  }
+  check("serve released the lock on exit", !existsSync(path.join(stateDir, "raftd.lock")));
+  check("port file cleaned up", !existsSync(path.join(stateDir, "raftd.port")));
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 const t0 = Date.now();
@@ -432,6 +619,9 @@ try {
   await phaseB(STATE_DIR, record.agentId);
   await phaseC(STATE_DIR, record.agentId);
   await phaseD(STATE_DIR, record.agentId);
+  await phaseH(STATE_DIR, record.agentId);
+  await phaseI(STATE_DIR, record.agentId);
+  await phaseJ(STATE_DIR, record.agentId);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));

@@ -112,6 +112,17 @@ export type OutboxFrame =
       reason: string;
       detail: string | null;
       since: string;
+    }
+  | {
+      /** Inter-agent / agent→operator message produced by the send_message tool. */
+      type: "agent:message";
+      agentId: string;
+      /** Tool call id — doubles as the dedupe key for the route. */
+      msgId: string;
+      /** Target agent name/agentId, or "main" (the human operator). */
+      to: string;
+      content: string;
+      at: string;
     };
 
 // ---------- agent registry (session doc "raft.agents") ----------
@@ -120,7 +131,8 @@ export type AgentModelRef = { provider: string; modelId: string };
 
 export type AgentConfigInput = {
   name: string;
-  model: AgentModelRef;
+  /** Omitted → daemon defaultModel (createAgent throws if neither exists). */
+  model?: AgentModelRef;
   instructions?: string;
   workspace?: string;
   thinkingLevel?: "minimal" | "low" | "medium" | "high";

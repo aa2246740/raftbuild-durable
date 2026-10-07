@@ -17,7 +17,6 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import type { AssistantMessage, Provider } from "@earendil-works/pi-ai";
 import {
   createRegistry,
-  defineDoc,
   Harness,
   watchEvents,
   type Conversation,
@@ -33,8 +32,12 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
-import { AgentsDoc, AgentRegistryError, sortRecords } from "./agents.ts";
+import { AgentBindingDoc, AgentsDoc, AgentRegistryError, sortRecords } from "./agents.ts";
 import { RaftAgentExtension } from "./extension.ts";
+import { MessagingExtension } from "./messaging.ts";
+import { parseWhen, RemindersDoc, type Reminder } from "./reminders.ts";
+import { MainInboxDoc, RoutingTransport, type AgentMessageFrame } from "./router.ts";
+import type { OutboxEnvelope } from "./transport.ts";
 import { projectLifecycle, type AgentLifecycleRecord } from "./lifecycle.ts";
 import { formatConcreteMessagesRuntimeInput, formatOperatorInput, formatSystemNoticeRuntimeInput } from "./runtimeInput.ts";
 import {
@@ -107,15 +110,6 @@ export interface Answer {
   reason?: string;
 }
 
-const AGENT_BINDING_DOC = "raft.agentBinding";
-const AgentBindingDoc = defineDoc<{ agentId: string }>({
-  kind: AGENT_BINDING_DOC,
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({ agentId: "" }),
-});
 
 const DEFAULT_MEMORY_MD = (name: string) =>
   `# ${name}\n\nLong-term memory for this agent. Add durable facts here as you learn them.\n`;
@@ -158,6 +152,7 @@ export class DurableDaemon {
     const registry = createRegistry();
     registry.install(CodingTools);
     registry.install(RaftAgentExtension);
+    registry.install(MessagingExtension);
 
     const storage = await openNodeSqliteStorage(path.join(stateDir, "session.sqlite"));
     const harness = await Harness.open(
@@ -174,7 +169,7 @@ export class DurableDaemon {
       BACKGROUND_CONTEXT,
     );
 
-    const transport = options.transport ?? new JsonlDeliveryTransport(deliveriesDir);
+    const transport = options.transport ?? new RoutingTransport(new JsonlDeliveryTransport(deliveriesDir));
     const daemon = new DurableDaemon(
       stateDir,
       workspacesDir,
@@ -186,6 +181,9 @@ export class DurableDaemon {
       transport,
       options as Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions,
     );
+    if (transport instanceof RoutingTransport) {
+      transport.attach((envelope) => daemon.routeMessage(envelope));
+    }
     return daemon;
   }
 
@@ -435,6 +433,115 @@ export class DurableDaemon {
     if (!submission) throw new Error(`unknown submission: ${submissionId}`);
     const settled = await submission.wait(BACKGROUND_CONTEXT);
     return this.readAnswer(settled);
+  }
+
+  /**
+   * Route a delivered `agent:message` frame: to "main" → durable operator
+   * inbox; to an agent → a sender-addressed envelope via postMessage with a
+   * deterministic requestId (exactly-once under retransmission). Unknown
+   * targets bounce back to the sender instead of retrying forever.
+   */
+  private async routeMessage(envelope: OutboxEnvelope & { frame: AgentMessageFrame }): Promise<void> {
+    const frame = envelope.frame;
+    const from = await this.getAgent(frame.agentId).catch(() => undefined);
+    const fromName = from?.name ?? frame.agentId;
+    if (frame.to === "main") {
+      await this.harness.commit(async (tx) => {
+        const doc = await tx.doc(MainInboxDoc);
+        doc.entries.push({
+          id: `msg-${frame.agentId}-${envelope.clientSeq}`,
+          fromAgentId: frame.agentId,
+          fromName,
+          text: frame.content,
+          at: frame.at,
+        });
+        if (doc.entries.length > 1000) doc.entries.splice(0, doc.entries.length - 1000);
+      }, BACKGROUND_CONTEXT);
+      return;
+    }
+    const target = await this.getAgent(frame.to).catch(() => undefined);
+    if (!target) {
+      // Bounce: tell the sender its message died, don't retransmit forever.
+      await this.postMessage(
+        frame.agentId,
+        `Delivery failed: no agent named "${frame.to}". Your message was not delivered.`,
+        { systemNotice: true, requestId: `route-bounce:${frame.agentId}:${envelope.clientSeq}` },
+      ).catch(() => {});
+      return;
+    }
+    await this.postMessage(
+      target.agentId,
+      {
+        message_id: `route-${frame.msgId}`,
+        timestamp: frame.at,
+        sender_name: fromName,
+        sender_type: "agent",
+        target: target.name,
+        content: frame.content,
+      },
+      { requestId: `route:${frame.agentId}:${envelope.clientSeq}` },
+    );
+  }
+
+  // ── reminders ───────────────────────────────────────────────────────────
+
+  /** Commit a durable reminder row; ReminderService arms the setTimeout. */
+  async remind(agentIdOrName: string, spec: string, text: string): Promise<Reminder> {
+    const record = await this.getAgent(agentIdOrName);
+    const { dueAt, everyMs } = parseWhen(spec);
+    const reminder: Reminder = {
+      id: `rem-${randomUUID().slice(0, 8)}`,
+      agentId: record.agentId,
+      text,
+      dueAt,
+      everyMs,
+      createdAt: new Date().toISOString(),
+    };
+    await this.harness.commit(async (tx) => {
+      const doc = await tx.doc(RemindersDoc);
+      doc.timers.push(reminder);
+    }, BACKGROUND_CONTEXT);
+    return reminder;
+  }
+
+  async listReminders(): Promise<Reminder[]> {
+    const state = await this.harness.snapshot(RemindersDoc, BACKGROUND_CONTEXT);
+    return state?.timers ?? [];
+  }
+
+  async rescheduleReminder(id: string, dueAt: string): Promise<void> {
+    await this.harness.commit(async (tx) => {
+      const doc = await tx.doc(RemindersDoc);
+      const t = doc.timers.find((r) => r.id === id);
+      if (t) t.dueAt = dueAt;
+    }, BACKGROUND_CONTEXT);
+  }
+
+  async deleteReminder(id: string): Promise<void> {
+    await this.harness.commit(async (tx) => {
+      const doc = await tx.doc(RemindersDoc);
+      doc.timers = doc.timers.filter((r) => r.id !== id);
+    }, BACKGROUND_CONTEXT);
+  }
+
+  /** All durable submissions admitted on an agent's conversation, any status. */
+  async submissions(agentIdOrName: string): Promise<readonly SubmissionRecord[]> {
+    const record = await this.getAgent(agentIdOrName);
+    const conversationId = Number(record.conversationId) as ConversationId;
+    const out: SubmissionRecord[] = [];
+    let cursor;
+    for (;;) {
+      const page = await this.storage.scanSubmissions({ conversationId }, 200, cursor, BACKGROUND_CONTEXT);
+      out.push(...page.items);
+      if (page.next === undefined) return out;
+      cursor = page.next;
+    }
+  }
+
+  /** Operator inbox entries (agent → "main" deliveries), oldest first. */
+  async mainInbox(): Promise<readonly { id: string; fromAgentId: string; fromName: string; text: string; at: string }[]> {
+    const state = await this.harness.snapshot(MainInboxDoc, BACKGROUND_CONTEXT);
+    return state?.entries ?? [];
   }
 
   /** Wait until an agent's conversation is idle (run + owned work drained). */
