@@ -55,6 +55,19 @@ export const OutboxDoc = defineDocFamily<OutboxDocState, string>({
   }),
 });
 
+/** Permanent per-key receipt. Unlike the legacy 4096-key ring, one receipt
+ * never evicts another; each document stays constant-sized. */
+export const OutcomeReceiptDoc = defineDocFamily<{ produced: boolean; projected: boolean }, string>({
+  kind: "raft.outcomeReceipt",
+  version: 1,
+  scope: "session",
+  family: true,
+  initial: () => ({ produced: false, projected: false }),
+});
+
+export const outcomeReceiptKey = (agentId: string, submissionId: string): string =>
+  JSON.stringify([agentId, submissionId]);
+
 export class OutboxError extends Error {
   constructor(
     message: string,
@@ -80,9 +93,8 @@ export function appendToOutboxDoc(
   if (dedupeKey !== undefined) {
     if (doc.producedSubmissionIds.includes(dedupeKey)) return { duplicate: true };
     doc.producedSubmissionIds.push(dedupeKey);
-    // Durable dedupe memory. Capped so the doc stays bounded; eviction means
-    // a >4096-settle-old submission could re-produce one frame — accepted,
-    // documented in NOTES.md (dedupe survives restart, only the far tail ages out).
+    // Legacy/tool-call compatibility ring. Outcome appends through AgentOutbox
+    // use permanent OutcomeReceiptDoc members instead of this bounded set.
     if (doc.producedSubmissionIds.length > 4096) {
       doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 4096);
     }
@@ -175,10 +187,19 @@ export class AgentOutbox {
         if (doc.unreliable) {
           throw new OutboxError(`agent ${this.agentId} outbox is unreliable since ${doc.unreliable.since}`, "unreliable");
         }
-        const result = appendToOutboxDoc(doc, frame, dedupeKey);
-        // Atomic side-effects: callers can co-commit state (e.g. the registry
-        // projection) so a crash can't split "frame committed, state lost".
-        if (!("duplicate" in result)) await inTx?.(tx);
+        // Outcome receipts outlive the bounded legacy/tool-call ring. Check
+        // them inside the SAME transaction as the frame and projection.
+        const receipt = dedupeKey !== undefined && frame.type === "agent:runtime:outcome"
+          ? await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(this.agentId, dedupeKey), dedupeKey)
+          : undefined;
+        const duplicate = receipt?.produced || (receipt && doc.producedSubmissionIds.includes(dedupeKey!));
+        const result = duplicate
+          ? { duplicate: true as const }
+          : appendToOutboxDoc(doc, frame, receipt ? undefined : dedupeKey);
+        if (receipt) receipt.produced = true;
+        // Legacy frame-only commits can still need projection. The callback
+        // owns its own persistent receipt, so it is safe on duplicates too.
+        if (receipt || !("duplicate" in result)) await inTx?.(tx);
         return result;
       }, this.ctx);
     } catch (err) {

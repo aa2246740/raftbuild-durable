@@ -22,7 +22,7 @@
  */
 import { execSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1003,53 +1003,47 @@ async function phaseO(stateDir: string): Promise<void> {
   const linux = process.platform === "linux";
   const E2E_DIR = path.join(PKG_DIR, "e2e");
 
-  // ── O1: a LIVE (SIGSTOP'd) takeover-mutex holder is never reaped ─────
-  // A separate OS process claims the mutex (mkdir + owner.json identity),
-  // gets SIGSTOPped mid-ownership, and the dir is aged past the stale
-  // threshold. A paused holder still owns — the mutex must survive and the
-  // pending acquire must only complete after the holder actually dies.
+  // ── O1: a LIVE (SIGSTOP'd) lock owner keeps exclusive ownership ─────
+  // Exercise the public lock API in a separate OS process. Pausing a real
+  // owner must not permit takeover; killing it must release ownership.
   if (!linux) {
-    skip("live mutex holder SIGSTOP", "linux-only (/proc state, signals)");
+    skip("paused lock owner SIGSTOP", "linux-only (/proc state, signals)");
   } else {
     const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-mutex-"));
-    await writeFile(path.join(dir, "raftd.lock"), JSON.stringify({
-      pid: 2147483647, token: "dead", startedAt: "2000-01-01T00:00:00Z",
-    }) + "\n");
-    const mutexDir = path.join(dir, "raftd.lock.takeover");
-    const holder = spawn(process.execPath, [path.join(E2E_DIR, "lock-mutex-holder.mjs"), mutexDir], {
+    const holder = spawn(process.execPath, ["--experimental-transform-types", path.join(E2E_DIR, "lock-mutex-holder.mjs"), dir], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let holderOut = "";
     holder.stdout.on("data", (d) => (holderOut += String(d)));
     holder.stderr.on("data", (d) => (holderOut += String(d)));
-    const claimed = await waitFor("mutex holder claimed", () => existsSync(path.join(mutexDir, "owner.json")), 15_000, 100);
-    check("takeover mutex claimed by separate process", claimed, holderOut.trim().slice(0, 80));
-    if (claimed) {
-      process.kill(holder.pid!, "SIGSTOP");
-      await sleep(400);
-      const st = procInfo(holder.pid!)?.state;
-      check("holder actually stopped", st === "T", `state=${st}`);
-      const old = new Date(Date.now() - 61_000);
-      await utimes(mutexDir, old, old); // past the stale-mtime fallback
-      let settledRes = "pending";
-      const acq = MachineLock.acquire(dir);
-      acq.then(() => { settledRes = "acquired"; })
-        .catch((e) => { settledRes = `err:${e instanceof Error ? e.message : e}`; });
-      await sleep(2_500);
-      check(
-        "live stopped holder's mutex not broken (acquire still pending, dir intact)",
-        settledRes === "pending" && existsSync(path.join(mutexDir, "owner.json")),
-        `acq=${settledRes} dir=${existsSync(mutexDir)}`,
-      );
-      process.kill(holder.pid!, "SIGCONT");
+    try {
+      const claimed = await waitFor("lock holder acquired", () => holderOut.split("\n").includes("ACQUIRED"), 15_000, 100);
+      check("machine lock acquired by separate process", claimed, holderOut.trim().slice(-120));
+      if (claimed) {
+        process.kill(holder.pid!, "SIGSTOP");
+        const stopped = await waitFor("holder enters stopped state", () => procInfo(holder.pid!)?.state === "T", 5_000, 100);
+        check("holder actually stopped", stopped, `state=${procInfo(holder.pid!)?.state}`);
+        let refused = false;
+        let reason = "unexpectedly acquired";
+        try {
+          const unexpected = await MachineLock.acquire(dir);
+          await unexpected.release();
+        } catch (err) {
+          refused = err instanceof MachineLockError;
+          reason = err instanceof Error ? err.message : String(err);
+        }
+        check("paused live owner refuses a second acquire", refused, reason);
+        holder.kill("SIGKILL");
+        await waitExit(holder);
+        const won = await MachineLock.acquire(dir).catch(() => null);
+        check("lock can be acquired after the owner dies", won !== null);
+        await won?.release();
+      }
+    } finally {
       holder.kill("SIGKILL");
-      const completed = await waitFor("pending acquire completes after holder death", () => settledRes !== "pending", 30_000, 200);
-      check("acquire completes once the holder is dead", completed && settledRes === "acquired", `res=${settledRes}`);
-      const won = await acq.catch(() => null);
-      await won?.release();
+      await waitExit(holder);
+      await rm(dir, { recursive: true, force: true });
     }
-    await waitExit(holder);
-    await rm(dir, { recursive: true, force: true });
   }
 
   // ── O2: zombie lock owner is dead, not locked ─────────────────────────
@@ -1145,27 +1139,61 @@ async function phaseO(stateDir: string): Promise<void> {
 
     // Late-fork member (independent review repro): a member forked AFTER
     // the ledger's last append is still ours — the group dies with its
-    // dead leader. `sh -c 'sleep 5; sleep 300 &'` exits as leader ~5s in,
-    // leaving a `sleep 300` member in the orphaned group.
+    // dead leader. The delayed writer is forked ~5s after the ledger append;
+    // reaping must prevent its side effect even if /proc retains zombies.
     const lateDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-late-"));
-    const leader = spawn("sh", ["-c", "sleep 5; sleep 300 &"], { detached: true, stdio: "ignore" });
+    const lateSideEffect = path.join(lateDir, "late-fork.txt");
+    const leader = spawn("sh", ["-c", 'sleep 5; (sleep 3; printf escaped > "$1") &', "late-fork", lateSideEffect], { detached: true, stdio: "ignore" });
     leader.unref();
-    await writeFile(path.join(lateDir, "tool-children.jsonl"),
-      JSON.stringify({ pid: leader.pid, start: processStartTime(leader.pid!) }) + "\n");
-    const leaderGone = await waitFor("late-fork leader exited", () => procInfo(leader.pid!) === undefined || DEAD_STATES.has(procInfo(leader.pid!)!.state), 15_000, 200);
-    const membersBefore = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" }).stdout?.toString().trim().split("\n").filter(Boolean) ?? [];
-    const dL = await DurableDaemon.open({ stateDir: lateDir, providers: [] });
-    const nLate = await dL.reapOrphanedToolChildren();
-    await dL.close();
-    await sleep(300);
-    const membersAfter = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" }).stdout?.toString().trim().split("\n").filter(Boolean) ?? [];
-    check(
-      "member forked after last ledger append still reaped",
-      leaderGone && membersBefore.length > 0 && nLate === 1 && membersAfter.length === 0,
-      `leader=${leader.pid} members=${membersBefore.join(",")}→${membersAfter.join(",")} reaped=${nLate}`,
-    );
-    for (const p of membersAfter) process.kill(Number(p), "SIGKILL");
-    await rm(lateDir, { recursive: true, force: true }).catch(() => {});
+    const ownedMembers = new Map<number, string>();
+    const liveMembers = (): number[] => {
+      const pids = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" })
+        .stdout?.toString().trim().split("\n").filter(Boolean).map(Number) ?? [];
+      return pids.filter((pid) => {
+        const info = procInfo(pid);
+        if (info === undefined || info.pgrp !== leader.pid || DEAD_STATES.has(info.state)) return false;
+        ownedMembers.set(pid, info.start);
+        return true;
+      });
+    };
+    try {
+      await writeFile(path.join(lateDir, "tool-children.jsonl"),
+        JSON.stringify({ pid: leader.pid, start: processStartTime(leader.pid!) }) + "\n");
+      const leaderGone = await waitFor("late-fork leader exited", () => {
+        const info = procInfo(leader.pid!);
+        return info === undefined || DEAD_STATES.has(info.state);
+      }, 15_000, 200);
+      const membersBefore = liveMembers();
+      const dL = await DurableDaemon.open({ stateDir: lateDir, providers: [] });
+      let nLate: number;
+      try {
+        nLate = await dL.reapOrphanedToolChildren();
+      } finally {
+        await dL.close();
+      }
+      const reaped = await waitFor("late-fork group stopped executing", () => liveMembers().length === 0, 2_000, 100);
+      const membersAfter = liveMembers();
+      check(
+        "member forked after last ledger append still reaped",
+        leaderGone && membersBefore.length > 0 && nLate === 1 && reaped,
+        `leader=${leader.pid} live members=${membersBefore.join(",")}→${membersAfter.join(",")} reaped=${nLate}`,
+      );
+      await sleep(3_500);
+      check("late-fork delayed side-effect never landed", !existsSync(lateSideEffect));
+    } finally {
+      // Only clean up processes from this fixture whose recorded identities
+      // still match; a failed assertion must not leave delayed writers behind.
+      liveMembers();
+      for (const [pid, start] of ownedMembers) {
+        const info = procInfo(pid);
+        if (info?.start === start && info.pgrp === leader.pid && !DEAD_STATES.has(info.state)) {
+          try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+        }
+      }
+      leader.kill("SIGKILL");
+      await waitExit(leader);
+      await rm(lateDir, { recursive: true, force: true }).catch(() => {});
+    }
 
     // A second `serve` on a live state dir must refuse WITHOUT killing the
     // running host's tool children (reaping runs post-lock only).
@@ -1203,7 +1231,9 @@ async function phaseO(stateDir: string): Promise<void> {
   // ── O4: legacy DB with a truly lost projection is rebuilt ────────────
   // Fixture = durable truth (settled submission + delivered outcome frame)
   // with the projection surgically absent — what a real old-version crash
-  // between outcome commit and registry projection leaves on disk.
+  // between outcome commit and registry projection leaves on disk. Remove
+  // the new receipt-version marker too: a current-schema atomic projection
+  // cannot be lost independently, and must not be mistaken for old state.
   const dLost = await DurableDaemon.open({ stateDir, providers: [] });
   const { record: lost } = await dLost.createAgent({ name: "lostproj", model: MODEL });
   const { record: kept } = await dLost.createAgent({ name: "keptproj", model: MODEL });
@@ -1226,9 +1256,13 @@ async function phaseO(stateDir: string): Promise<void> {
     if (rl) {
       rl.runs = 0; rl.failures = 0; rl.lastOutcome = null; rl.terminalFailure = null;
       delete (rl as { projectedSubmissions?: string[] }).projectedSubmissions;
+      delete rl.outcomeReceiptsVersion;
     }
     const rk = doc.records[kept.agentId];
-    if (rk) delete (rk as { projectedSubmissions?: string[] }).projectedSubmissions;
+    if (rk) {
+      delete (rk as { projectedSubmissions?: string[] }).projectedSubmissions;
+      delete rk.outcomeReceiptsVersion;
+    }
   }, BACKGROUND_CONTEXT);
   await dLost.close();
   const dLost2 = await DurableDaemon.open({ stateDir, providers: [] });
@@ -1266,7 +1300,7 @@ async function phaseO(stateDir: string): Promise<void> {
     }
   }
   if (!PY) {
-    skip("wrapper shared readiness + thin CLI", "no python with fastapi/uvicorn/httpx (pip install -r deploy/requirements.txt)");
+    skip("wrapper shared readiness + thin CLI", "no python with fastapi/uvicorn/httpx (python3 -m pip install ./deploy)");
   } else {
     const wstate = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wstate-"));
     const wdata = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wdata-"));
@@ -1371,8 +1405,23 @@ async function phaseO(stateDir: string): Promise<void> {
         const imgHash = hash.stdout?.toString().split(" ")[0];
         const srcHash = localHash.stdout?.toString().split(" ")[0];
         check("image source matches this commit", imgHash === srcHash, `img=${imgHash} src=${srcHash}`);
-        const cli = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=e2ekey", name, "node", "--experimental-transform-types", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", "/data/.raftd"], { stdio: "pipe", timeout: 60_000 });
-        check("thin CLI inside container via public key", cli.status === 0, cli.stderr?.toString().slice(-120) ?? "");
+        // Match Dockerfile's RAFTD_STATE. An unused directory lets the CLI
+        // open an empty offline daemon and return 0 without testing auth.
+        const dockerState = "/data/raftd";
+        const created = await fetch(`http://127.0.0.1:${pubPort}/api/agents`, {
+          method: "POST",
+          headers: { authorization: "Bearer e2ekey", "content-type": "application/json" },
+          body: JSON.stringify({ name: "docker-cli-probe", model: `${MODEL.provider}/${MODEL.modelId}` }),
+        });
+        const probe = await created.json() as { agentId?: string };
+        check("HTTP creates Docker CLI probe agent", created.status === 201 && typeof probe.agentId === "string", `status=${created.status} agent=${probe.agentId}`);
+        const cliArgs = [name, "node", "--experimental-transform-types", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", dockerState];
+        const cli = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=e2ekey", ...cliArgs], { stdio: "pipe", timeout: 60_000 });
+        const cliOut = cli.stdout?.toString() ?? "";
+        check("thin CLI inside container reads the HTTP-created agent", cli.status === 0 && typeof probe.agentId === "string" && cliOut.includes(probe.agentId) && cliOut.includes("docker-cli-probe"), `${cliOut.trim()} ${cli.stderr?.toString() ?? ""}`.slice(-200));
+        const rejected = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=wrong-e2e-key", ...cliArgs], { stdio: "pipe", timeout: 60_000 });
+        const rejectedOut = `${rejected.stdout?.toString() ?? ""}\n${rejected.stderr?.toString() ?? ""}`;
+        check("thin CLI inside container rejects a wrong public key", rejected.status !== null && rejected.status !== 0 && /401|unauthorized/i.test(rejectedOut), rejectedOut.trim().slice(-160));
       }
       spawnSync("docker", ["rm", "-f", name], { stdio: "pipe", timeout: 30_000 });
     }

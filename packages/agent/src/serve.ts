@@ -101,6 +101,7 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
   // RAFTD_KEY gates every /api/* call (the console stores it in localStorage).
   const apiKey = String(process.env.RAFTD_KEY ?? "").trim() || undefined;
+  const wrapperInstance = process.env.RAFTD_WRAPPER_INSTANCE;
   // A public listener without an admin key hands strangers the ability to
   // create agents and run tool calls — refuse unless explicitly opted out.
   if (!loopback && !apiKey && process.env.RAFTD_INSECURE !== "1") {
@@ -116,6 +117,9 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   // Bracket IPv6 literals — `http://::1:4777` is not a valid base URL.
   const base = host.includes(":") ? `http://[${host}]:${port}` : `http://${host}:${port}`;
   const server = createServer(async (req, res) => {
+    // The wrapper verifies this instance before forwarding any response and
+    // strips the header at its public edge. Never echo a request value here.
+    if (wrapperInstance) res.setHeader("x-raftd-instance", wrapperInstance);
     try {
       const url = new URL(req.url ?? "/", base);
       const parts = url.pathname.split("/").filter(Boolean);
@@ -317,7 +321,9 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   });
   // Port file: local CLI commands discover the live host instead of opening
   // the storage themselves (one Harness per storage — never two).
-  const portFile = path.join(daemon.stateDir, "raftd.port");
+  // A managed child must never publish its internal port as public CLI
+  // discovery, even briefly during boot or after a wrapper restart.
+  const portFile = path.join(daemon.stateDir, wrapperInstance ? "raftd.internal-port" : "raftd.port");
   await writeFile(portFile, host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`, "utf8");
   server.once("close", () => void rm(portFile, { force: true }).catch(() => {}));
   return server;

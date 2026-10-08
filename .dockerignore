@@ -7,3 +7,4 @@ deploy/*.egg-info
 deploy/repo.tar.gz
 *.sqlite
 packages/agent/e2e/report.md
+**/__pycache__

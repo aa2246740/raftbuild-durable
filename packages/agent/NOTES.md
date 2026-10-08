@@ -1,5 +1,25 @@
 # daemon → pi-durable 移植笔记
 
+## issue #2 四轮复测修复
+
+以下是当前实现；后面的轮次表保留当时的修复记录。
+
+- 单实例锁改为 `raftd.lock.sqlite` 的持续 SQLite 写事务。暂停不释放，进程死亡自动释放，
+  不再收割/重建 takeover 目录。JSON 仅诊断与旧协议活 owner 防护；CLI 在打开 Harness 前拿锁。
+  锁数据库必须保留且仅由 SQLite 管理；升级前先停止旧二进制，使用支持 SQLite 文件锁的本地 state。
+- outcome 的 `produced` / `projected` 存在每 submission 的固定大小 durable receipt，
+  与 outbox frame、registry 投影同事务。旧 bounded ledger 不再决定 outcome 去重。
+  迁移可分批中断重启，并从 settled records 重建准确计数；旧 ring/live queue/default delivery ledger
+  证明已经产出的帧不会重产。自定义 transport 无交付账本且旧前缀已被遗忘时，按至少一次语义保守补发，
+  新 receipt 随后永久记住。128 条 outbox 的慢消费者/故障 fail-closed 规则保持。
+- 原生 CLI 和 wrapper 都先持有永久 `raftd.wrapper.sqlite` 宿主锁，再获取 storage 锁；
+  wrapper child 由宿主管理，只获取 storage 锁。重复实例及 child 恢复空窗不能覆盖公开发现；
+  child 只写内部发现；每次 child 启动有独立实例身份，
+  readiness 和响应都验证身份/存活，公开响应去掉内部身份头。健康 up 包含公开发现已就绪。
+  共享启动不受单个请求取消影响；写请求上游断连后不盲重放可能已经提交的操作。
+- `pnpm test:reliability` 无需模型 key，实际验证锁、4096 历史边界和 Python/Node wrapper。
+  E2E 后代检查排除非执行 zombie 并验证延迟副作用；Docker CLI 必须从实际 state 读到 HTTP 创建的 agent。
+
 ## 对照关系（先说人话版）
 
 Raft daemon 的方式：agent 是**外部进程**——daemon 按 runtime 类型（claude / codex / pi）

@@ -134,25 +134,38 @@ async function main(): Promise<number> {
         ? parseWhen(`every ${compactIdleEnv}`).everyMs ?? undefined
         : Number(compactIdleEnv) || undefined)
     : (cmd === "serve" ? 30 * 60_000 : undefined);
-  const daemon = await DurableDaemon.open({
-    stateDir,
-    providers: "env",
-    // No hardcoded provider: RAFTD_MODEL wins; otherwise the daemon picks a
-    // model from whichever provider is actually configured (OpenAI-only users
-    // must not silently end up on the GLM default).
-    defaultModel: modelRef(process.env.RAFTD_MODEL),
-    compactOnWakeMs: compactIdleMs,
-    onWarn: (m) => console.error(`[warn] ${m}`),
+  // Claim ownership before opening storage: even opening a second Harness
+  // can run migrations/recovery. Remote commands above never open storage.
+  const lock = await MachineLock.acquire(stateDir, {
+    managedByWrapper: Boolean(process.env.RAFTD_WRAPPER_INSTANCE),
   });
+  let daemon: DurableDaemon;
+  try {
+    daemon = await DurableDaemon.open({
+      stateDir,
+      providers: "env",
+      // No hardcoded provider: RAFTD_MODEL wins; otherwise the daemon picks a
+      // model from whichever provider is actually configured (OpenAI-only users
+      // must not silently end up on the GLM default).
+      defaultModel: modelRef(process.env.RAFTD_MODEL),
+      compactOnWakeMs: compactIdleMs,
+      onWarn: (m) => console.error(`[warn] ${m}`),
+    });
+  } catch (error) {
+    await lock.release();
+    throw error;
+  }
   if (daemon.providerCount === 0) {
     console.error(
       "warning: no model API keys detected (zhipu / ZAI_CODING_CN_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY).\n" +
         "Agents will be created but every message lands as no_model terminal failure. Export a key and restart."
     );
   }
-  const shutdown = async () => {
-    await daemon.close();
-  };
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = () => shutdownPromise ??= (async () => {
+    try { await daemon.close(); }
+    finally { await lock.release(); }
+  })();
   const defaultSigHandler = () => void shutdown().then(() => process.exit(0));
   process.on("SIGINT", defaultSigHandler);
   process.on("SIGTERM", defaultSigHandler);
@@ -327,7 +340,6 @@ async function main(): Promise<number> {
         break;
       }
       case "serve": {
-        const lock = await MachineLock.acquire(daemon.stateDir);
         // Reap a previous host's orphans only after the lock proves we're
         // the owner — inside open() this would kill a live daemon's tools.
         await daemon.reapOrphanedToolChildren();
@@ -344,7 +356,6 @@ async function main(): Promise<number> {
           reminders.stop();
           server.close();
           await shutdown();
-          await lock.release();
           process.exit(0);
         };
         process.off("SIGINT", defaultSigHandler);
@@ -359,7 +370,7 @@ async function main(): Promise<number> {
         return 1;
     }
   } finally {
-    if (cmd !== "serve") await shutdown();
+    await shutdown();
   }
   return 0;
 }

@@ -5,6 +5,7 @@
   "packageManager": "pnpm@10.20.0",
   "scripts": {
     "typecheck": "pnpm -C packages/agent typecheck",
+    "test:reliability": "pnpm -C packages/agent test:reliability && python3 -m unittest discover -s deploy/tests -v",
     "e2e": "pnpm -C packages/agent e2e",
     "cli": "pnpm -C packages/agent cli",
     "raftd": "pnpm -C packages/agent raftd"
