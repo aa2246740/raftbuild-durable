@@ -175,9 +175,11 @@ export type AgentRecord = {
   } | null;
   runs: number;
   failures: number;
-  /** Durable record of which submissions already projected their outcome into
-   * this record — makes the registry update idempotent across crash/repair. */
+  /** Legacy bounded projection ledger, emptied after receipt migration.
+   * Permanent per-outcome documents now provide projection idempotency. */
   projectedSubmissions: string[];
+  /** Versioned migration marker; authoritative dedupe lives in per-outcome docs. */
+  outcomeReceiptsVersion?: number;
 };
 
 export type AgentsDocState = {
@@ -203,6 +205,6 @@ export type OutboxDocState = {
   unreliable: { reason: string; since: string } | null;
   /** Human resolution — the only way a marked agent delivers again. */
   resolution: { kind: string; note: string; at: string } | null;
-  /** Ring buffer of submission ids that already produced a frame. */
+  /** Legacy outcome/tool-call ring; new outcome receipts live in their own docs. */
   producedSubmissionIds: string[];
 };

@@ -52,7 +52,7 @@ import {
 } from "./workspaces.ts";
 import { DurableEventNormalizer } from "./events.ts";
 import { DEAD_STATES, procInfo, processStartTime } from "./machineLock.ts";
-import { AgentOutbox, OutboxDoc, OutboxError } from "./outbox.ts";
+import { AgentOutbox, OutboxDoc, OutboxError, OutcomeReceiptDoc, outcomeReceiptKey } from "./outbox.ts";
 import { JsonlDeliveryTransport, type OutboxTransport } from "./transport.ts";
 import { terminalFailureFromRawText, turnCompletedOutcome } from "./outcome.ts";
 import type {
@@ -164,6 +164,8 @@ export class DurableDaemon {
     readonly providerCount: number,
   ) {}
 
+  private readonly outcomeMigrations = new Map<string, Promise<void>>();
+  private readonly outcomeReceiptsReady = new Set<string>();
   private readonly outboxes = new Map<string, AgentOutbox>();
   private readonly pumps = new Map<string, { stop: () => Promise<unknown> }>();
   private readonly normalizers = new Map<string, DurableEventNormalizer>();
@@ -380,6 +382,7 @@ export class DurableDaemon {
       runs: 0,
       failures: 0,
       projectedSubmissions: [],
+      outcomeReceiptsVersion: 1,
     };
     try {
       await this.harness.commit(async (tx) => {
@@ -964,14 +967,15 @@ export class DurableDaemon {
 
   /**
    * Turn a settled submission into an E1/E2 outbox frame, exactly once.
-   * Dedupe rides on OutboxDoc.producedSubmissionIds so a reopen cannot
-   * re-produce a frame a crashed watcher already wrote.
+   * Permanent per-submission receipts preserve identity even after arbitrarily
+   * long histories; frame, receipt and registry projection commit together.
    */
   private async produceOutcome(
     agentId: string,
     settled: Extract<ParsedEvent, { kind: "submission_settled" }>,
     run?: { counters: { textEvents: number; toolCalls: number; runtimeErrors: number }; sticky: boolean; firstError: string | null },
   ): Promise<void> {
+    await this.ensureOutcomeReceipts(agentId);
     let outcome;
     if (settled.status === "done") {
       const counters = run?.counters ?? { textEvents: 0, toolCalls: 0, runtimeErrors: 0 };
@@ -1022,12 +1026,9 @@ export class DurableDaemon {
       const doc = await tx.doc(AgentsDoc);
       const record = doc.records[agentId];
       if (!record) return;
-      record.projectedSubmissions ??= [];
-      if (record.projectedSubmissions.includes(settled.submissionId)) return;
-      record.projectedSubmissions.push(settled.submissionId);
-      if (record.projectedSubmissions.length > 4096) {
-        record.projectedSubmissions.splice(0, record.projectedSubmissions.length - 4096);
-      }
+      const receipt = await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(agentId, settled.submissionId), settled.submissionId);
+      if (receipt.projected) return;
+      receipt.projected = true;
       if (settled.status === "done") record.runs++;
       else record.failures++;
       // Only overwrite lastOutcome with a NEWER-or-equal submission — a
@@ -1066,12 +1067,7 @@ export class DurableDaemon {
       settled.submissionId,
       project,
     );
-    if ("duplicate" in appended) {
-      // Frame already delivered (pre-atomic state may lack the projection):
-      // run the same idempotent update so a crash-lost projection repairs.
-      await this.harness.commit(project, BACKGROUND_CONTEXT).catch(() => {});
-      return;
-    }
+    if ("duplicate" in appended) return;
     this.opts.onFrame?.(agentId, appended.clientSeq);
   }
 
@@ -1079,7 +1075,7 @@ export class DurableDaemon {
    * Sweep settled submissions that settled while no pump watched (e.g. daemon
    * was closed between place and settle) — produce any missing outcome frame.
    */
-  private async reconcileSubmissions(record: AgentRecord): Promise<void> {
+  private async settledSubmissions(record: AgentRecord) {
     const settled: { id: string; status: "done" | "unanswered"; reason?: string }[] = [];
     for (const status of ["done", "unanswered"] as const) {
       let cursor;
@@ -1101,57 +1097,15 @@ export class DurableDaemon {
         cursor = page.next;
       }
     }
-    // Legacy migration: records written before the projection ledger have no
-    // projectedSubmissions field. We cannot tell which settled submissions
-    // the old code already projected — and a real old-version crash can have
-    // left "frame delivered, projection lost". So REBUILD instead of
-    // increment: recompute runs/failures/lastOutcome/terminalFailure from the
-    // durable submissions themselves. An already-projected upgrade lands the
-    // same numbers; a lost projection is repaired. The repair loop below then
-    // only fills in missing outcome FRAMES (dedupe by submissionId).
-    if (record.projectedSubmissions === undefined && settled.length > 0) {
-      await this.harness
-        .commit(async (tx: Tx) => {
-          const doc = await tx.doc(AgentsDoc);
-          const r = doc.records[record.agentId];
-          if (!r || r.projectedSubmissions !== undefined) return;
-          let runs = 0;
-          let failures = 0;
-          let latest: (typeof settled)[number] | undefined;
-          for (const s of settled) {
-            if (s.status === "done") runs++;
-            else failures++;
-            if (latest === undefined || Number(s.id) >= Number(latest.id)) latest = s;
-          }
-          r.runs = runs;
-          r.failures = failures;
-          if (latest !== undefined) {
-            const done = latest.status === "done";
-            const evidence = done
-              ? undefined
-              : terminalFailureFromRawText(failureKindFor(latest.reason), latest.reason ?? "unanswered");
-            r.lastOutcome = {
-              kind: done ? "turn_completed" : "terminal_failure",
-              status: latest.status,
-              submissionId: latest.id,
-              reason: done ? null : (latest.reason ?? "unanswered"),
-              errorClass: evidence?.errorClass ?? null,
-              at: new Date().toISOString(),
-            };
-            if (evidence !== undefined && evidence.errorAction !== null && evidence.errorAction !== "none") {
-              r.terminalFailure = {
-                failureKind: evidence.failureKind,
-                fingerprint: evidence.fingerprint,
-                detail: evidence.detail ?? latest.reason ?? "terminal failure",
-                at: new Date().toISOString(),
-              };
-            }
-          }
-          r.projectedSubmissions = settled.map((s) => s.id).slice(-4096);
-        }, BACKGROUND_CONTEXT)
-        .catch(() => {});
-    }
+    return settled;
+  }
+
+  private async reconcileSubmissions(record: AgentRecord): Promise<void> {
+    await this.ensureOutcomeReceipts(record.agentId);
+    const settled = await this.settledSubmissions(record);
     for (const s of settled) {
+      const receipt = await this.harness.snapshot(OutcomeReceiptDoc, outcomeReceiptKey(record.agentId, s.id), BACKGROUND_CONTEXT);
+      if (receipt?.produced && receipt.projected) continue;
       await this.produceOutcome(record.agentId, {
         kind: "submission_settled",
         submissionId: s.id,
@@ -1159,6 +1113,109 @@ export class DurableDaemon {
         reason: s.reason,
       });
     }
+  }
+
+  /** All live watchers and explicit reconciliation wait for the same migration;
+   * otherwise a settlement racing upgrade could be counted, then overwritten. */
+  private async ensureOutcomeReceipts(agentId: string): Promise<void> {
+    if (this.outcomeReceiptsReady.has(agentId)) return;
+    let pending = this.outcomeMigrations.get(agentId);
+    if (!pending) {
+      pending = (async () => {
+        const record = (await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT))?.records[agentId];
+        if (!record) return;
+        if (record.outcomeReceiptsVersion !== 1) {
+          await this.migrateOutcomeReceipts(record, await this.settledSubmissions(record));
+        }
+        this.outcomeReceiptsReady.add(agentId);
+      })();
+      this.outcomeMigrations.set(agentId, pending);
+    }
+    try { await pending; }
+    finally { if (this.outcomeMigrations.get(agentId) === pending) this.outcomeMigrations.delete(agentId); }
+  }
+
+  /** One-time, restartable migration of BOTH old schemas (absent or bounded
+   * projection ledger). Rebuild counters from durable settlements, never from
+   * an evicting set. Only evidence proves a frame was produced: the legacy
+   * ring, a live outbox entry, or the default delivery ledger. A custom
+   * transport's forgotten prefix is unknowable and is conservatively replayed
+   * once under the existing at-least-once contract, never silently discarded. */
+  private async migrateOutcomeReceipts(
+    record: AgentRecord,
+    settled: { id: string; status: "done" | "unanswered"; reason?: string }[],
+  ): Promise<void> {
+    const current = (await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT))?.records[record.agentId];
+    if (!current || current.outcomeReceiptsVersion === 1) return;
+    const outbox = await this.outboxFor(record.agentId).state();
+    const produced = new Set(outbox?.producedSubmissionIds ?? []);
+    for (const entry of outbox?.entries ?? []) {
+      if (entry.frame.type === "agent:runtime:outcome") produced.add(entry.frame.submissionId);
+    }
+    try {
+      const ledger = await readFile(path.join(this.deliveriesDir, `${record.agentId}.jsonl`), "utf8");
+      for (const line of ledger.split("\n")) {
+        try {
+          const envelope = JSON.parse(line) as OutboxEnvelope;
+          if (envelope.agentId === record.agentId && envelope.frame?.type === "agent:runtime:outcome") {
+            produced.add(envelope.frame.submissionId);
+          }
+        } catch { /* ignore torn final line; no proof means conservative replay */ }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    // Bounded batches keep each migration transaction small. The final version
+    // marker is written only AFTER all receipts, so a crash restarts safely.
+    for (let offset = 0; offset < settled.length; offset += 100) {
+      const batch = settled.slice(offset, offset + 100);
+      await this.harness.commit(async (tx) => {
+        for (const s of batch) {
+          const receipt = await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(record.agentId, s.id), s.id);
+          receipt.projected = true;
+          if (produced.has(s.id)) receipt.produced = true;
+        }
+      }, BACKGROUND_CONTEXT);
+    }
+    await this.harness.commit(async (tx) => {
+      const doc = await tx.doc(AgentsDoc);
+      const r = doc.records[record.agentId];
+      if (!r || r.outcomeReceiptsVersion === 1) return;
+      r.runs = settled.filter((s) => s.status === "done").length;
+      r.failures = settled.length - r.runs;
+      const latest = settled.reduce<(typeof settled)[number] | undefined>(
+        (prev, s) => !prev || Number(s.id) > Number(prev.id) ? s : prev, undefined,
+      );
+      if (latest) {
+        const evidence = latest.status === "done" ? undefined
+          : terminalFailureFromRawText(failureKindFor(latest.reason), latest.reason ?? "unanswered");
+        // An existing projection for this (or a newer) submission is also
+        // evidence that terminalFailure reflects subsequent human decisions.
+        // In particular resolveAgent() deliberately clears it; replaying the
+        // old diagnostic must not undo that resolution or replace richer data.
+        const projectedId = Number(r.lastOutcome?.submissionId);
+        if (!r.lastOutcome || !Number.isFinite(projectedId) || projectedId < Number(latest.id)) {
+          r.lastOutcome = {
+            kind: evidence ? "terminal_failure" : "turn_completed",
+            status: latest.status,
+            submissionId: latest.id,
+            reason: latest.status === "done" ? null : (latest.reason ?? "unanswered"),
+            errorClass: evidence?.errorClass ?? null,
+            at: new Date().toISOString(),
+          };
+          if (evidence && evidence.errorAction !== null && evidence.errorAction !== "none") {
+            r.terminalFailure = {
+              failureKind: evidence.failureKind,
+              fingerprint: evidence.fingerprint,
+              detail: evidence.detail ?? latest.reason ?? "terminal failure",
+              at: new Date().toISOString(),
+            };
+          }
+        }
+      }
+      r.projectedSubmissions = []; // obsolete ring; receipts are authoritative
+      r.outcomeReceiptsVersion = 1;
+    }, BACKGROUND_CONTEXT);
   }
 }
 
