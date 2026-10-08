@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --experimental-transform-types
+#!/usr/bin/env -S node
 /**
  * raftd — CLI for the durable daemon.
  *
@@ -25,6 +25,9 @@ import { DurableDaemon } from "./daemon.ts";
 import { MachineLock } from "./machineLock.ts";
 import { parseWhen, ReminderService } from "./reminders.ts";
 import { startServer } from "./serve.ts";
+import { readApiKey } from "./auth.ts";
+import { buildBoundedVisibleCrashDetail } from "./diagnostics.ts";
+import { parseArgs, RemoteApiError, timeoutFrom, waitForRemoteAnswer } from "./cliSupport.ts";
 import type { AgentModelRef } from "./types.ts";
 
 const USAGE = `raftd — durable agent daemon (pi-durable)
@@ -36,7 +39,9 @@ const USAGE = `raftd — durable agent daemon (pi-durable)
   list                                                all agents
   show <agent>                                        record + lifecycle
   lifecycle <agent>                                   projected lifecycle state
-  send <agent> <text...> [-m file] [--no-wait] [--raw] [--request-id id]
+  send <agent> <text...> [-m file] [--no-wait] [--raw] [--request-id id] [--timeout 5m]
+  wait <agent> <submissionId> [--timeout 5m]          continue waiting via serve
+  update <agent> [--name name] [--model p/m] [--instructions text] [--thinking level]
   steer <agent> <text...> [--no-wait]                 input into running turn
   abort <agent> | stop <agent> | start <agent>
   resolve <agent> [note...]                           human outbox resolution
@@ -48,43 +53,19 @@ const USAGE = `raftd — durable agent daemon (pi-durable)
   remind <agent> <when> <text...>                     durable reminder ("in 30m"/"every 1h"/"at 14:30")
   reminders                                           pending reminders
   delete <agent> [--workspace]
-  usage | inspect
+  usage [agent] | inspect
   serve [--port N] [--host H]                         daemon loop + web console (default :4777)
 
 --state <dir> or RAFTD_STATE (default ./.raftd); --model or RAFTD_MODEL.
-Serve env: RAFTD_PORT, RAFTD_HOST, RAFTD_KEY (api auth), RAFTD_COMPACT_IDLE_MS.
+Send without serve only queues work. Start serve to execute it.
+Wait is unlimited by default; --timeout accepts seconds or ms/s/m/h.
+Serve env: RAFTD_PORT, RAFTD_HOST, RAFTD_KEY (otherwise local raftd.token), RAFTD_COMPACT_IDLE_MS.
 `;
-
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | boolean> } {
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg.startsWith("--")) {
-      const eq = arg.indexOf("=");
-      if (eq > 0) {
-        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
-      } else {
-        const key = arg.slice(2);
-        const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith("--") && !["no-wait", "raw"].includes(key)) {
-          flags[key] = next;
-          i++;
-        } else {
-          flags[key] = true;
-        }
-      }
-    } else {
-      positional.push(arg);
-    }
-  }
-  return { positional, flags };
-}
 
 function modelRef(spec: string | undefined): AgentModelRef | undefined {
   if (!spec) return undefined;
   const slash = spec.indexOf("/");
-  if (slash <= 0) throw new Error(`model must be provider/modelId, got: ${spec}`);
+  if (slash <= 0 || slash === spec.length - 1) throw new Error(`model must be provider/modelId, got: ${spec}`);
   return { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) };
 }
 
@@ -94,11 +75,22 @@ function modelRef(spec: string | undefined): AgentModelRef | undefined {
 async function main(): Promise<number> {
   const { positional, flags } = parseArgs(process.argv.slice(2));
   const cmd = positional[0];
-  if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
+  if (!cmd || cmd === "help" || flags.help === true) {
     process.stdout.write(USAGE);
     return 0;
   }
 
+  timeoutFrom(flags.timeout); // validate before submitting any work
+  if (flags.m !== undefined) {
+    if (!["send", "steer"].includes(cmd)) throw new Error("-m is only valid for send or steer");
+    if (positional.length > 2) throw new Error("use either message text or -m file, not both");
+    positional.push(await readFile(String(flags.m), "utf8"));
+  }
+  const needsAgent = new Set(["show", "lifecycle", "send", "steer", "wait", "update", "abort", "stop", "start", "resolve", "reset", "compact", "events", "outbox", "delete", "remind"]);
+  if (needsAgent.has(cmd) && !positional[1]?.trim()) throw new Error(`${cmd} requires <agent>`);
+  if (["send", "steer"].includes(cmd) && !positional.slice(2).join(" ").trim()) throw new Error(`${cmd} requires text or -m file`);
+  if (cmd === "wait" && !/^\d+$/.test(positional[2] ?? "")) throw new Error("wait requires a numeric <submissionId>");
+  if (cmd === "remind" && (!positional[2] || !positional.slice(3).join(" ").trim())) throw new Error("remind requires <agent> <when> <text>");
   const stateDir = (flags.state as string) ?? process.env.RAFTD_STATE ?? ".raftd";
 
   // If `raftd serve` was here (port file), act as a thin client — opening the
@@ -110,13 +102,13 @@ async function main(): Promise<number> {
     if (existsSync(portFile)) {
       const addr = (await readFile(portFile, "utf8")).trim();
       try {
-        return await runRemote(`http://${addr}`, cmd, positional, flags);
+        return await runRemote(`http://${addr}`, cmd, positional, flags, await readApiKey(stateDir));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         // Only a REAL connection failure means "serve is gone" — an HTTP
         // error the serve returned must reach the user verbatim, not be
         // disguised as an unreachable daemon (verified footgun).
-        if (!/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR|socket|network/i.test(msg)) {
+        if (err instanceof RemoteApiError || !/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR|socket|network/i.test(msg)) {
           console.error(`remote: ${msg}`);
           return 1;
         }
@@ -126,6 +118,10 @@ async function main(): Promise<number> {
         return 1;
       }
     }
+  }
+
+  if (["wait", "abort", "stop", "start", "resolve", "reset", "compact", "delete"].includes(cmd)) {
+    throw new Error(`${cmd} requires a running serve; start: raftd serve --state ${JSON.stringify(stateDir)}`);
   }
 
   const compactIdleEnv = String(process.env.RAFTD_COMPACT_IDLE_MS ?? "").trim();
@@ -158,7 +154,7 @@ async function main(): Promise<number> {
   if (daemon.providerCount === 0) {
     console.error(
       "warning: no model API keys detected (zhipu / ZAI_CODING_CN_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY).\n" +
-        "Agents will be created but every message lands as no_model terminal failure. Export a key and restart."
+        "Without credentials, create requires --model provider/modelId and submitted work cannot call a model. Set OPENAI_API_KEY (or another supported provider key), select --model or RAFTD_MODEL if needed, then restart serve."
     );
   }
   let shutdownPromise: Promise<void> | undefined;
@@ -175,7 +171,7 @@ async function main(): Promise<number> {
     if (!id) throw new Error("missing <agent>");
     return id;
   };
-  const text = (from: number) => positional.slice(from).join(" ") || (flags.m as string) || "";
+  const text = (from: number) => positional.slice(from).join(" ");
 
   try {
     switch (cmd) {
@@ -192,7 +188,7 @@ async function main(): Promise<number> {
           workspace: flags.workspace as string | undefined,
           thinkingLevel: flags.thinking as "minimal" | "low" | "medium" | "high" | undefined,
         });
-        console.log(`created ${record.agentId} (${record.name})  conversation=${record.conversationId}  workspace=${record.workspacePath}`);
+        console.log(`created ${record.agentId} (${record.name})  conversation=${record.conversationId}  workspace=${record.workspacePath}  model=${record.model.provider}/${record.model.modelId}`);
         break;
       }
       case "list": {
@@ -215,36 +211,30 @@ async function main(): Promise<number> {
         console.log(JSON.stringify(await daemon.lifecycle(record.agentId), null, 2));
         break;
       }
-      case "send": {
-        const record = await daemon.getAgent(needAgent());
-        const body = text(2);
-        if (!body) throw new Error("send needs text");
-        const { submissionId } = await daemon.postMessage(record.agentId, body, {
-          requestId: flags["request-id"] as string | undefined,
-          raw: flags.raw === true,
-        });
-        console.log(`submission ${submissionId}`);
-        if (flags["no-wait"] !== true) {
-          const answer = await daemon.waitForAnswer(submissionId);
-          if (answer.status === "done") {
-            console.log(answer.text ?? "(empty answer)");
-          } else {
-            console.log(`unanswered: ${answer.reason ?? "?"}`);
-            return 2;
-          }
-        }
-        break;
-      }
+      case "send":
       case "steer": {
         const record = await daemon.getAgent(needAgent());
         const body = text(2);
-        if (!body) throw new Error("steer needs text");
-        const { submissionId } = await daemon.postMessage(record.agentId, body, { whenBusy: "steer" });
-        console.log(`steered submission ${submissionId}`);
-        if (flags["no-wait"] !== true) {
-          const answer = await daemon.waitForAnswer(submissionId);
-          console.log(answer.status === "done" ? (answer.text ?? "(empty)") : `unanswered: ${answer.reason ?? "?"}`);
-        }
+        if (!body) throw new Error(`${cmd} needs text or -m file`);
+        const { submissionId } = await daemon.postMessage(record.agentId, body, {
+          requestId: flags["request-id"] as string | undefined,
+          raw: flags.raw === true,
+          ...(cmd === "steer" ? { whenBusy: "steer" as const } : {}),
+          execute: false,
+        });
+        console.log(`queued submission ${submissionId}; no tasks were started`);
+        console.log(`Start: raftd serve --state ${JSON.stringify(stateDir)}`);
+        console.log(`Then: raftd wait ${JSON.stringify(record.name)} ${submissionId} --state ${JSON.stringify(stateDir)}`);
+        break;
+      }
+      case "update": {
+        const record = await daemon.updateAgent(needAgent(), {
+          ...(typeof flags.name === "string" ? { name: flags.name } : {}),
+          ...(typeof flags.model === "string" ? { model: modelRef(flags.model) } : {}),
+          ...(typeof flags.instructions === "string" ? { instructions: flags.instructions } : {}),
+          ...(typeof flags.thinking === "string" ? { thinkingLevel: flags.thinking as "minimal" | "low" | "medium" | "high" } : {}),
+        });
+        console.log(JSON.stringify(record, null, 2));
         break;
       }
       case "abort":
@@ -289,7 +279,7 @@ async function main(): Promise<number> {
       case "deliveries": {
         const id = positional[1];
         const dir = daemon.deliveriesDir;
-        const files = id ? [`${id}.jsonl`] : undefined;
+        const files = id ? [`${(await daemon.getAgent(id)).agentId}.jsonl`] : undefined;
         if (files) {
           const file = path.join(dir, files[0]);
           if (existsSync(file)) console.log(await readFile(file, "utf8"));
@@ -317,13 +307,13 @@ async function main(): Promise<number> {
         const body = positional.slice(3).join(" ");
         if (!agent || !when || !body) throw new Error('usage: remind <agent> <when> <text...> (when: "in 30m" / "every 1h" / "at 14:30" / ISO)');
         const r = await daemon.remind(agent, when, body);
-        console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt}${r.everyMs ? " (repeats)" : ""}`);
+        console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt} [${r.timeZone ?? "UTC"}]${r.everyMs ? " (repeats)" : ""}`);
         break;
       }
       case "reminders": {
         const timers = await daemon.listReminders();
         if (timers.length === 0) console.log("(no pending reminders)");
-        for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt}${t.everyMs ? `  every=${t.everyMs}ms` : ""}  "${t.text}"`);
+        for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt} [${t.timeZone ?? "UTC"}]${t.everyMs ? `  every=${t.everyMs}ms` : ""}  "${t.text}"`);
         break;
       }
       case "delete": {
@@ -332,7 +322,7 @@ async function main(): Promise<number> {
         break;
       }
       case "usage": {
-        console.log(JSON.stringify(await daemon.usage(), null, 2));
+        console.log(JSON.stringify(await daemon.usage(positional[1]), null, 2));
         break;
       }
       case "inspect": {
@@ -350,7 +340,7 @@ async function main(): Promise<number> {
         const host = (flags.host as string) ?? process.env.RAFTD_HOST ?? "127.0.0.1";
         const server = await startServer(daemon, { host, port });
         const agents = await daemon.listAgents();
-        console.log(`raftd serving — console http://${host}:${port}  state=${daemon.stateDir}`);
+        console.log(`raftd serving — console ${process.env.RAFTD_WRAPPER_INSTANCE ? server.consoleUrl.split("#")[0] : server.consoleUrl}  state=${daemon.stateDir}`);
         console.log(`  ${agents.length} agent(s); ${(await daemon.listReminders()).length} reminder(s) armed`);
         const exit = async () => {
           reminders.stop();
@@ -381,9 +371,10 @@ async function runRemote(
   cmd: string,
   positional: string[],
   flags: Record<string, string | boolean>,
+  apiKey?: string,
 ): Promise<number> {
-  const call = async (method: string, p: string, body?: unknown) => {
-    const key = String(process.env.RAFTD_KEY ?? "").trim();
+  const call = async (method: string, p: string, body?: unknown, timeoutMs?: number) => {
+    const key = apiKey;
     const r = await fetch(base + "/api/" + p, {
       method,
       headers: {
@@ -391,9 +382,9 @@ async function runRemote(
         ...(key ? { authorization: `Bearer ${key}` } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(body !== undefined || p === "state" ? 30_000 : 120_000),
+      signal: AbortSignal.timeout(Math.max(1, Math.ceil(timeoutMs ?? (body !== undefined || p === "state" ? 30_000 : 120_000)))),
     });
-    if (!r.ok) throw new Error(`remote ${method} ${p}: ${(await r.json().catch(() => ({}))).error ?? r.statusText}`);
+    if (!r.ok) throw new RemoteApiError(r.status, `remote ${method} ${p}: ${(await r.json().catch(() => ({}))).error ?? r.statusText}`);
     return r.json();
   };
   const id = positional[1];
@@ -408,7 +399,7 @@ async function runRemote(
         ...(typeof flags.workspace === "string" ? { workspace: flags.workspace } : {}),
         ...(flags.thinking ? { thinking: flags.thinking } : {}),
       });
-      console.log(`created ${rec.agentId} (${rec.name})`);
+      console.log(`created ${rec.agentId} (${rec.name})  model=${rec.model.provider}/${rec.model.modelId}`);
       return 0;
     }
     case "list": {
@@ -428,16 +419,30 @@ async function runRemote(
       });
       console.log(`submission ${r.submissionId}`);
       if (flags["no-wait"] !== true) {
-        const a: any = await call("GET", `agents/${encodeURIComponent(id)}/answer?submissionId=${encodeURIComponent(r.submissionId)}`);
-        console.log(a.status === "done" ? (a.text ?? "(empty)") : `unanswered: ${a.reason ?? "?"}`);
-        if (a.status !== "done") return 2;
+        const a = await waitForRemoteAnswer((route, ms) => call("GET", route, undefined, ms), id!, r.submissionId, timeoutFrom(flags.timeout));
+        return printAnswer(a);
       }
       return 0;
     }
-    case "abort": case "stop": case "start": case "resolve": case "compact": case "reset":
-      await call("POST", `agents/${encodeURIComponent(id)}/${cmd}`, { note: bodyText || undefined, instructions: bodyText || undefined, handoff: bodyText || undefined });
-      console.log(`${cmd} ok`);
+    case "wait": {
+      if (!id || !positional[2]) throw new Error("usage: wait <agent> <submissionId> [--timeout 5m]");
+      return printAnswer(await waitForRemoteAnswer((route, ms) => call("GET", route, undefined, ms), id, positional[2], timeoutFrom(flags.timeout)));
+    }
+    case "update": {
+      const record = await call("PATCH", `agents/${encodeURIComponent(id!)}`, {
+        ...(typeof flags.name === "string" ? { name: flags.name } : {}),
+        ...(typeof flags.model === "string" ? { model: flags.model } : {}),
+        ...(typeof flags.instructions === "string" ? { instructions: flags.instructions } : {}),
+        ...(typeof flags.thinking === "string" ? { thinking: flags.thinking } : {}),
+      });
+      console.log(JSON.stringify(record, null, 2));
       return 0;
+    }
+    case "abort": case "stop": case "start": case "resolve": case "compact": case "reset": {
+      const result = await call("POST", `agents/${encodeURIComponent(id!)}/${cmd}`, { note: bodyText || undefined, instructions: bodyText || undefined, handoff: bodyText || undefined });
+      console.log(`${cmd} ok ${JSON.stringify(result)}`);
+      return 0;
+    }
     case "lifecycle": console.log(JSON.stringify(await call("GET", `agents/${encodeURIComponent(id)}/lifecycle`), null, 2)); return 0;
     case "show": {
       const s = await state();
@@ -460,7 +465,7 @@ async function runRemote(
       return 0;
     }
     case "delete": await call("DELETE", `agents/${encodeURIComponent(id)}${flags.workspace !== undefined ? "?workspace=true" : ""}`); console.log("deleted"); return 0;
-    case "usage": console.log(JSON.stringify((await state()).usage, null, 2)); return 0;
+    case "usage": console.log(JSON.stringify(id ? await call("GET", `agents/${encodeURIComponent(id)}/usage`) : (await state()).usage, null, 2)); return 0;
     case "inspect": console.log(JSON.stringify(await call("GET", "inspect"), null, 2)); return 0;
     case "main": {
       const box = (await state()).mainInbox;
@@ -470,18 +475,24 @@ async function runRemote(
     }
     case "remind": {
       const r: any = await call("POST", "reminders", { agent: id, when: positional[2], text: positional.slice(3).join(" ") });
-      console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt}`);
+      console.log(`reminder ${r.id} → ${r.agentId} at ${r.dueAt} [${r.timeZone ?? "UTC"}]`);
       return 0;
     }
     case "reminders": {
       const timers = (await state()).reminders;
       if (!timers.length) console.log("(no pending reminders)");
-      for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt}  "${t.text}"`);
+      for (const t of timers) console.log(`${t.id}  ${t.agentId}  due=${t.dueAt} [${t.timeZone ?? "UTC"}]  "${t.text}"`);
       return 0;
     }
     default:
       throw new Error(`no remote path for ${cmd}`);
   }
+}
+
+function printAnswer(answer: { status: string; text?: string; reason?: string; detail?: string }): number {
+  if (answer.status === "done") { console.log(answer.text ?? "(empty)"); return 0; }
+  console.error(`unanswered: ${answer.reason ?? "unknown"}${answer.detail ? " — " + buildBoundedVisibleCrashDetail(answer.detail) : ""}`);
+  return 2;
 }
 
 main()

@@ -117,6 +117,16 @@ async function waitExit(p: ReturnType<typeof spawn>, graceMs = 8_000): Promise<v
   await Promise.race([new Promise((r) => p.once("exit", r)), sleep(graceMs)]);
 }
 
+/** Native-host positive requests authenticate with that fixture's generated
+ * token. Negative authentication checks intentionally keep using raw fetch. */
+async function authorizedFetch(stateDir: string, input: string, init: RequestInit = {}): Promise<Response> {
+  const token = (await readFile(path.join(stateDir, "raftd.token"), "utf8")).trim();
+  if (!token) throw new Error("test host published an empty token");
+  const headers = new Headers(init.headers);
+  headers.set("authorization", `Bearer ${token}`);
+  return fetch(input, { ...init, headers });
+}
+
 async function waitFor(desc: string, fn: () => Promise<boolean> | boolean, timeoutMs = 120_000, interval = 1_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -249,7 +259,6 @@ async function phaseB(stateDir: string, agentId: string) {
 
 function runWorker(mode: string, stateDir: string, agentId: string, submissionId?: string) {
   const args = [
-    "--experimental-transform-types",
     path.join(PKG_DIR, "e2e", "crash-worker.ts"),
     mode,
     stateDir,
@@ -478,7 +487,7 @@ async function phaseFG(stateDir: string) {
     target: "main",
     content: "first line\nsecond line",
   });
-  check("envelope has target/msg/time/type", /\[target=main msg=abcdef12 time=2026-10-07T12:00:00Z type=user\]/.test(msg), msg.split("\n").pop() ?? "");
+  check("envelope has target/msg/time/type/sender", /\[target=main msg=abcdef12 time=2026-10-07T12:00:00Z type=user sender=wu\]/.test(msg), msg.split("\n").pop() ?? "");
   check("sender handle", msg.includes("@wu: "), msg.slice(0, 80));
   check("continuation lines indented (anti-forgery)", msg.includes("first line\n  second line"));
   const wrapped = formatConcreteMessagesRuntimeInput([
@@ -602,8 +611,8 @@ async function phaseI(stateDir: string, agentId: string) {
 
 function runCli(stateDir: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
-    const p = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), ...args], {
-      env: { ...process.env, RAFTD_STATE: stateDir, ...extraEnv },
+    const p = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), ...args], {
+      env: { ...process.env, RAFTD_STATE: stateDir, RAFTD_KEY: "", RAFTD_INSECURE: "", ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -636,8 +645,10 @@ async function phaseJ(stateDir: string, alphaId: string) {
 
   // 3) Real serve: lock + HTTP + console + thin-CLI + API round trip.
   await lock.release();
-  const serve = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--port", "4888"], {
-    env: { ...process.env, RAFTD_STATE: stateDir },
+  const portJ = await freePort();
+  const baseJ = `http://127.0.0.1:${portJ}`;
+  const serve = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--port", String(portJ)], {
+    env: { ...process.env, RAFTD_STATE: stateDir, RAFTD_KEY: "", RAFTD_INSECURE: "" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let serveOut = "";
@@ -646,17 +657,19 @@ async function phaseJ(stateDir: string, alphaId: string) {
   try {
     const up = await waitFor("console responds", async () => {
       try {
-        return (await fetch("http://127.0.0.1:4888/api/state")).ok;
+        return (await authorizedFetch(stateDir, `${baseJ}/api/state`)).ok;
       } catch {
         return false;
       }
     }, 30_000, 500);
     if (!check("serve came up", up, serveOut.trim().slice(0, 200))) return;
+    check("default native host rejects absent token", (await fetch(`${baseJ}/api/state`)).status === 401);
+    check("default native host rejects wrong token", (await fetch(`${baseJ}/api/state`, { headers: { authorization: "Bearer wrong-token" } })).status === 401);
 
-    const st = (await (await fetch("http://127.0.0.1:4888/api/state")).json()) as { agents: { agentId: string }[] };
+    const st = (await (await authorizedFetch(stateDir, `${baseJ}/api/state`)).json()) as { agents: { agentId: string }[] };
     check("/api/state lists the agents", st.agents.some((a) => a.agentId === alphaId), `${st.agents.length} agents`);
 
-    const html = await (await fetch("http://127.0.0.1:4888/")).text();
+    const html = await (await authorizedFetch(stateDir, `${baseJ}/`)).text();
     check("console HTML served", html.includes("raftd") && html.includes("<script") && html.includes("New agent"));
 
     // Thin-CLI over the port file.
@@ -665,7 +678,7 @@ async function phaseJ(stateDir: string, alphaId: string) {
 
     // Full API round trip on a fresh agent.
     const gamma: { agentId: string } = await (
-      await fetch("http://127.0.0.1:4888/api/agents", {
+      await authorizedFetch(stateDir, `${baseJ}/api/agents`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: "gamma" }),
@@ -673,38 +686,38 @@ async function phaseJ(stateDir: string, alphaId: string) {
     ).json();
     check("agent created over HTTP", !!gamma.agentId, gamma.agentId);
     const sub: { submissionId: string } = await (
-      await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/messages`, {
+      await authorizedFetch(stateDir, `${baseJ}/api/agents/${gamma.agentId}/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ text: 'Reply with exactly the single word "READY".' }),
       })
     ).json();
-    const answer = (await (await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/answer?submissionId=${sub.submissionId}`)).json()) as {
+    const answer = (await (await authorizedFetch(stateDir, `${baseJ}/api/agents/${gamma.agentId}/answer?submissionId=${sub.submissionId}`)).json()) as {
       status: string;
       text?: string;
     };
     check("HTTP round trip answered", answer.status === "done" && /READY/i.test(answer.text ?? ""), (answer.text ?? answer.status).slice(0, 80));
 
     // API semantics: 409 on name collision, 400 on garbage.
-    const dup = await fetch("http://127.0.0.1:4888/api/agents", {
+    const dup = await authorizedFetch(stateDir, `${baseJ}/api/agents`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "gamma" }),
     });
     check("duplicate name → 409", dup.status === 409, `status=${dup.status}`);
-    const bad = await fetch("http://127.0.0.1:4888/api/agents", {
+    const bad = await authorizedFetch(stateDir, `${baseJ}/api/agents`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{not json",
     });
     check("malformed JSON → 400", bad.status === 400, `status=${bad.status}`);
-    const badBusy = await fetch(`http://127.0.0.1:4888/api/agents/${gamma.agentId}/messages`, {
+    const badBusy = await authorizedFetch(stateDir, `${baseJ}/api/agents/${gamma.agentId}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "hi", whenBusy: "bogus" }),
     });
     check("garbage whenBusy → 400", badBusy.status === 400, `status=${badBusy.status}`);
-    const gone = await fetch(`http://127.0.0.1:4888/api/agents/no-such-agent/lifecycle`);
+    const gone = await authorizedFetch(stateDir, `${baseJ}/api/agents/no-such-agent/lifecycle`);
     check("unknown agent → 404", gone.status === 404, `status=${gone.status}`);
   } finally {
     serve.kill("SIGTERM");
@@ -742,8 +755,9 @@ async function phaseK(stateDir: string) {
     check("no compact on first message (no observed idle)", compactCalls === 0, `calls=${compactCalls}`);
     await sleep(2_000); // go quiet past the 1.5s threshold
     const m2 = await daemon.postMessage(record.agentId, "Say TWO", { raw: true });
-    check("wake-compact triggered once", compactCalls === 1, `calls=${compactCalls}`);
     const a2 = await daemon.waitForAnswer(m2.submissionId);
+    const maintained = await waitFor("background wake compact", () => compactCalls === 1, 30_000, 50);
+    check("wake-compact triggered once after durable enqueue", maintained && compactCalls === 1, `calls=${compactCalls}`);
     check("message still answered after recycle", a2.status === "done", a2.status);
   } finally {
     await daemon.close();
@@ -808,17 +822,17 @@ async function phaseM(stateDir: string) {
 
   // HTTP validation + thin-CLI parity against a real serve.
   const portA = await freePort();
-  const srv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portA)], {
-    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  const srv = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portA)], {
+    env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" }, stdio: ["ignore", "pipe", "pipe"],
   });
   let srvOut = "";
   srv.stdout.on("data", (d) => (srvOut += String(d)));
   srv.stderr.on("data", (d) => (srvOut += String(d)));
-  const up = await waitFor("serve up", async () => (await fetch(`http://127.0.0.1:${portA}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  const up = await waitFor("serve up", async () => (await authorizedFetch(stateDir, `http://127.0.0.1:${portA}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
   check("test serve up", up, srvOut.trim().slice(-120));
   if (up) {
     const post = (p: string, body: unknown) =>
-      fetch(`http://127.0.0.1:${portA}/api/${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      authorizedFetch(stateDir, `http://127.0.0.1:${portA}/api/${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     check("POST agents body=null → 400", (await post("agents", null)).status === 400);
     check("POST agents name=123 → 400", (await post("agents", { name: 123 })).status === 400);
     check('POST agents name="   " → 400', (await post("agents", { name: "   " })).status === 400);
@@ -828,7 +842,7 @@ async function phaseM(stateDir: string) {
     const nova = (await nu.json()) as { agentId: string };
     check("POST messages text=object → 400", (await post(`agents/${nova.agentId}/messages`, { text: { x: 1 } })).status === 400);
     check("POST reminders when=at 25:99 → 400", (await post("reminders", { agent: "nova", when: "at 25:99", text: "x" })).status === 400);
-    check("GET answer foreign submission → 404", (await fetch(`http://127.0.0.1:${portA}/api/agents/${nova.agentId}/answer?submissionId=424242`)).status === 404);
+    check("GET answer foreign submission → 404", (await authorizedFetch(stateDir, `http://127.0.0.1:${portA}/api/agents/${nova.agentId}/answer?submissionId=424242`)).status === 404);
 
     // Thin-CLI parity (serve holds the state, CLI is remote).
     const delAll = await runCli(stateDir, ["deliveries"], { RAFTD_KEY: "" });
@@ -852,14 +866,15 @@ async function phaseM(stateDir: string) {
 
     // Bearer: keyed serve + thin CLI must authenticate.
     const portB = await freePort();
-    const srv2 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portB)], {
+    const srv2 = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portB)], {
       env: { ...process.env, RAFTD_KEY: "k3y" }, stdio: ["ignore", "pipe", "pipe"],
     });
     const up2 = await waitFor("keyed serve up", async () => (await fetch(`http://127.0.0.1:${portB}/api/state`, { headers: { authorization: "Bearer k3y" } }).catch(() => null))?.ok ?? false, 60_000, 500);
     check("keyed serve up", up2);
     if (up2) {
+      check("explicit-key host rejects absent bearer", (await fetch(`http://127.0.0.1:${portB}/api/state`)).status === 401);
       const noKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "" });
-      check("thin CLI without RAFTD_KEY → 401 surfaced", noKey.code !== 0 && /401|unauthorized|remote/i.test(noKey.out), noKey.out.trim().slice(0, 100));
+      check("thin CLI with stale discovered token → 401 surfaced", noKey.code !== 0 && /401|unauthorized|remote/i.test(noKey.out), noKey.out.trim().slice(0, 100));
       const withKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "k3y" });
       check("thin CLI with RAFTD_KEY works", withKey.code === 0, withKey.out.trim().slice(0, 100));
     }
@@ -871,7 +886,7 @@ async function phaseM(stateDir: string) {
   }
 
   // Non-loopback without RAFTD_KEY refuses to start.
-  const refusedSrv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--host", "0.0.0.0", "--port", String(await freePort())], {
+  const refusedSrv = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--host", "0.0.0.0", "--port", String(await freePort())], {
     env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" }, stdio: ["ignore", "pipe", "pipe"],
   });
   let refOut = "";
@@ -967,25 +982,25 @@ async function phaseN(stateDir: string) {
 
   // whenBusy=reject on a genuinely running conversation → 409, not 500.
   const portN = await freePort();
-  const srvN = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portN)], {
-    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  const srvN = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portN)], {
+    env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" }, stdio: ["ignore", "pipe", "pipe"],
   });
   let srvNOut = "";
   srvN.stdout.on("data", (d) => (srvNOut += String(d)));
   srvN.stderr.on("data", (d) => (srvNOut += String(d)));
-  const upN = await waitFor("reject-test serve up", async () => (await fetch(`http://127.0.0.1:${portN}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  const upN = await waitFor("reject-test serve up", async () => (await authorizedFetch(stateDir, `http://127.0.0.1:${portN}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
   check("reject-test serve up", upN, srvNOut.trim().slice(-100));
   if (upN) {
-    const mk = await fetch(`http://127.0.0.1:${portN}/api/agents`, {
+    const mk = await authorizedFetch(stateDir, `http://127.0.0.1:${portN}/api/agents`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "busybot" }),
     });
     const { agentId: busyId } = (await mk.json()) as { agentId: string };
-    await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+    await authorizedFetch(stateDir, `http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "Run exactly this bash command: sleep 60; echo done. Then reply DONE." }),
     });
-    const rej = await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+    const rej = await authorizedFetch(stateDir, `http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: "jump the queue", whenBusy: "reject" }),
     });
@@ -1010,7 +1025,7 @@ async function phaseO(stateDir: string): Promise<void> {
     skip("paused lock owner SIGSTOP", "linux-only (/proc state, signals)");
   } else {
     const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-mutex-"));
-    const holder = spawn(process.execPath, ["--experimental-transform-types", path.join(E2E_DIR, "lock-mutex-holder.mjs"), dir], {
+    const holder = spawn(process.execPath, [path.join(E2E_DIR, "lock-mutex-holder.mjs"), dir], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let holderOut = "";
@@ -1199,14 +1214,15 @@ async function phaseO(stateDir: string): Promise<void> {
     // running host's tool children (reaping runs post-lock only).
     const serveDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-srvsafe-"));
     const srvPort = await freePort();
-    const srv1 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", serveDir, "--port", String(srvPort)], {
+    const srv1 = spawn("node", [path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", serveDir, "--port", String(srvPort)], {
+      env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let srv1Out = "";
     srv1.stdout.on("data", (d) => (srv1Out += String(d)));
     srv1.stderr.on("data", (d) => (srv1Out += String(d)));
     const srvUp = await waitFor("first serve up", async () =>
-      (await fetch(`http://127.0.0.1:${srvPort}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+      (await authorizedFetch(serveDir, `http://127.0.0.1:${srvPort}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
     // Now the ledger gains an entry — as if the live daemon's tool spawned
     // it. A second `serve` must die at the lock WITHOUT reaping it.
     const worker = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
@@ -1415,7 +1431,7 @@ async function phaseO(stateDir: string): Promise<void> {
         });
         const probe = await created.json() as { agentId?: string };
         check("HTTP creates Docker CLI probe agent", created.status === 201 && typeof probe.agentId === "string", `status=${created.status} agent=${probe.agentId}`);
-        const cliArgs = [name, "node", "--experimental-transform-types", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", dockerState];
+        const cliArgs = [name, "node", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", dockerState];
         const cli = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=e2ekey", ...cliArgs], { stdio: "pipe", timeout: 60_000 });
         const cliOut = cli.stdout?.toString() ?? "";
         check("thin CLI inside container reads the HTTP-created agent", cli.status === 0 && typeof probe.agentId === "string" && cliOut.includes(probe.agentId) && cliOut.includes("docker-cli-probe"), `${cliOut.trim()} ${cli.stderr?.toString() ?? ""}`.slice(-200));
@@ -1467,7 +1483,7 @@ async function phaseL(stateDir: string) {
     try {
       await daemon.postMessage(record.agentId, "hello", { raw: true });
     } catch (err) {
-      permanent = err instanceof OutboxError || err instanceof AgentRegistryError;
+      permanent = err instanceof AgentRegistryError && err.code === "conflict" && /stopped/i.test(err.message);
     }
     check("postMessage to stopped agent is a permanent error", permanent);
     await daemon.startAgent(record.agentId);

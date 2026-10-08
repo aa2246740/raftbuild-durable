@@ -9,7 +9,7 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "erasableSyntaxOnly": false
+    "erasableSyntaxOnly": true
   },
   "include": ["src/**/*.ts", "e2e/**/*.ts", "examples/**/*.ts"]
 }

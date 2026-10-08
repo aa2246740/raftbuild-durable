@@ -44,9 +44,12 @@ export const MainInboxDoc = defineDoc<MainInboxState>({
  * throw so the pump retransmits rather than dropping.
  */
 export class RoutingTransport implements OutboxTransport {
+  private readonly inner: OutboxTransport;
   private router: ((envelope: OutboxEnvelope & { frame: AgentMessageFrame }) => Promise<void>) | null = null;
 
-  constructor(private readonly inner: OutboxTransport) {}
+  constructor(inner: OutboxTransport) {
+    this.inner = inner;
+  }
 
   /** Bind the router (called once by DurableDaemon.open). */
   attach(router: (envelope: OutboxEnvelope & { frame: AgentMessageFrame }) => Promise<void>): void {

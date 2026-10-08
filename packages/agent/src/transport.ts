@@ -30,10 +30,13 @@ export interface OutboxTransport {
  * what makes the e2e honest.
  */
 export class JsonlDeliveryTransport implements OutboxTransport {
+  private readonly dir: string;
   /** (agentId → committed clientSeqs) — loaded from the ledger on first touch. */
   private readonly seen = new Map<string, Set<number>>();
 
-  constructor(private readonly dir: string) {}
+  constructor(dir: string) {
+    this.dir = dir;
+  }
 
   /**
    * The outbox can re-send a frame that was already committed here (crash
@@ -102,10 +105,16 @@ export class ScriptedTransport implements OutboxTransport {
 
 /** Wrap another transport with failure for the first `failures` sends. */
 export class FlakyTransport implements OutboxTransport {
+  private readonly inner: OutboxTransport;
+  private failures: number;
+
   constructor(
-    private readonly inner: OutboxTransport,
-    private failures: number,
-  ) {}
+    inner: OutboxTransport,
+    failures: number,
+  ) {
+    this.inner = inner;
+    this.failures = failures;
+  }
 
   async send(envelope: OutboxEnvelope): Promise<void> {
     if (this.failures > 0) {

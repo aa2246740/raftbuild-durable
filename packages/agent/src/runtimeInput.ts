@@ -11,7 +11,7 @@
 import type { IncomingMessage } from "./types.ts";
 
 export const RESPONSE_TARGET_HINT =
-  "Reply in the channel or create/reply in a thread as appropriate; use each message's `target` and `msg` fields to choose the exact target.";
+  "Normal answer text stays in this agent's conversation. To reply to another agent, explicitly call send_message with the envelope's reply_to target; use target \"main\" to notify the human operator. Do not send acknowledgements that only invite another acknowledgement.";
 
 export function formatUtcTimestamp(value: string | number | Date | undefined): string {
   if (value === undefined) return "-";
@@ -73,11 +73,14 @@ export function formatIncomingMessage(message: IncomingMessage): string {
       ].join("\n")
     : "";
 
-  const target = message.target ?? "-";
+  const target = encodeURIComponent(message.target ?? "-");
   const msgId = message.message_id ? getMessageShortId(message.message_id) : "-";
   const time = message.timestamp ? formatUtcTimestamp(message.timestamp) : "-";
   const senderType = formatVisibleActorType(message.sender_type);
-  const body = `[target=${target} msg=${msgId} time=${time}${senderType}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}`;
+  const reply = message.reply_to ? ` reply_to=${encodeURIComponent(message.reply_to)}` : "";
+  const chain = message.chain_id ? ` chain=${encodeURIComponent(message.chain_id)} hop=${message.hop ?? 0}` : "";
+  const description = message.sender_description ? ` description=${encodeURIComponent(message.sender_description)}` : "";
+  const body = `[target=${target} msg=${msgId} time=${time}${senderType}${reply}${chain} sender=${encodeURIComponent(message.sender_name)}${description}] ${formatSenderHandle(message)}: ${indentAgentBodyContinuationLines(message.content)}`;
   return threadJoinPrefix ? `${threadJoinPrefix}\n${body}` : body;
 }
 
@@ -114,4 +117,31 @@ export function formatInboxUpdateRuntimeInput(
 /** A plain text input from the local operator, no envelope. */
 export function formatOperatorInput(text: string): string {
   return text;
+}
+
+/** Parse our visible envelope without restricting sender names to ASCII.
+ * New envelopes carry an encoded sender field, so colons/spaces/descriptions
+ * are unambiguous. Old envelopes are accepted for persisted history. */
+export function parseIncomingEnvelope(raw: string): { from: string; text: string } | undefined {
+  const match = raw.match(/(?:^|\n)\[target=([^\]\n]*)\] (@[^\n]*)(?:\n((?: {2}[^\n]*(?:\n|$))*))?/);
+  if (!match) return undefined;
+  const sender = match[1].match(/(?:^| )sender=([^ ]+)/)?.[1];
+  let from: string;
+  let firstLine: string;
+  if (sender) {
+    try {
+      from = decodeURIComponent(sender);
+      const description = match[1].match(/(?:^| )description=([^ ]+)/)?.[1];
+      const prefix = formatSenderHandle({ sender_name: from, ...(description ? { sender_description: decodeURIComponent(description) } : {}) }) + ": ";
+      if (!match[2].startsWith(prefix)) return undefined;
+      firstLine = match[2].slice(prefix.length);
+    } catch { return undefined; }
+  } else {
+    const legacy = match[2].match(/^@(.+?): (.*)$/);
+    if (!legacy) return undefined;
+    from = legacy[1].split(" — ")[0];
+    firstLine = legacy[2];
+  }
+  const continuation = match[3]?.replace(/\n$/, "").split("\n").map((line) => line.replace(/^ {2}/, "")).join("\n");
+  return { from, text: firstLine + (continuation ? `\n${continuation}` : "") };
 }

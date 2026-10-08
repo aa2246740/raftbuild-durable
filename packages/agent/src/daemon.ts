@@ -17,7 +17,9 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import type { AssistantMessage, Provider } from "@earendil-works/pi-ai";
 import {
   createRegistry,
+  configure,
   Harness,
+  UsageDoc,
   watchEvents,
   type Conversation,
   type ConversationId,
@@ -35,26 +37,34 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 
 import { AgentBindingDoc, AgentsDoc, AgentRegistryError, sortRecords } from "./agents.ts";
 import { RaftAgentExtension } from "./extension.ts";
-import { MessagingExtension } from "./messaging.ts";
+import { createMessagingExtension, MessageContextDoc, MessageChainDoc, messagingLimits, type MessageChain, type MessagingLimits } from "./messaging.ts";
 import { parseWhen, RemindersDoc, type Reminder } from "./reminders.ts";
 import { MainInboxDoc, RoutingTransport, type AgentMessageFrame } from "./router.ts";
 import type { OutboxEnvelope } from "./transport.ts";
-import { projectLifecycle, type AgentLifecycleRecord } from "./lifecycle.ts";
+import { projectLifecycle, unresolvedFailure, type AgentLifecycleRecord } from "./lifecycle.ts";
 import { formatConcreteMessagesRuntimeInput, formatOperatorInput, formatSystemNoticeRuntimeInput } from "./runtimeInput.ts";
 import {
   deleteWorkspaceDirectory,
+  ensureWorkspaceRoot,
   initializeAgentWorkspace,
   resolveWorkspaceDirectoryPath,
   scanWorkspaceDirectories,
   DELIVERIES_DIR_NAME,
   type AgentWorkspaceSeedFile,
   type WorkspaceDirectoryInfo,
+  type WorkspaceOwnership,
 } from "./workspaces.ts";
+import { ToolExecutionEnv } from "./toolEnv.ts";
+import { pickDefaultModel, validateAgentName, validateAgentSettings, validateModel } from "./modelPolicy.ts";
 import { DurableEventNormalizer } from "./events.ts";
 import { DEAD_STATES, procInfo, processStartTime } from "./machineLock.ts";
 import { AgentOutbox, OutboxDoc, OutboxError, OutcomeReceiptDoc, outcomeReceiptKey } from "./outbox.ts";
 import { JsonlDeliveryTransport, type OutboxTransport } from "./transport.ts";
 import { terminalFailureFromRawText, turnCompletedOutcome } from "./outcome.ts";
+import { enqueueInput } from "./admission.ts";
+import { RecoveryEpochDoc } from "./recovery.ts";
+import { scrubRuntimeErrorDiagnosticText } from "./diagnostics.ts";
+import { parseIncomingEnvelope } from "./runtimeInput.ts";
 import type {
   AgentConfigInput,
   AgentModelRef,
@@ -90,12 +100,14 @@ export interface DurableDaemonOptions {
   onFrame?: (agentId: string, clientSeq: number) => void;
   /**
    * Cold-wake recycle (raft RFC 070): when an agent the daemon has seen
-   * active goes quiet for longer than this, its next postMessage first runs
-   * a compaction pass so the resumed turn starts on a lean context. A daemon
+   * active goes quiet for longer than this, its next message is persisted
+   * before a background compaction pass is queued at an idle boundary. A daemon
    * restart does NOT count as idle — cold start never burns a model call.
    * Default off; `raftd serve` enables it (RAFTD_COMPACT_IDLE_MS, 30m).
    */
   compactOnWakeMs?: number;
+  /** Durable message-chain and per-agent send limits. */
+  messaging?: MessagingLimits;
   /** Called for non-fatal internal warnings (compaction, routing bounces). */
   onWarn?: (message: string) => void;
 }
@@ -106,6 +118,8 @@ export interface CreateAgentResult {
 }
 
 export interface PostMessageOptions {
+  /** Admit durably without starting the session-wide scheduler (offline CLI). */
+  execute?: boolean;
   whenBusy?: "steer" | "followUp" | "reject";
   /** Idempotent submit key; same requestId never submits twice. */
   requestId?: string;
@@ -113,6 +127,8 @@ export interface PostMessageOptions {
   raw?: boolean;
   /** Treat the message as a system notice envelope. */
   systemNotice?: boolean;
+  /** Internal routing context; never derived from model-authored tool arguments. */
+  messageChain?: MessageChain;
 }
 
 export interface Answer {
@@ -121,10 +137,13 @@ export interface Answer {
   /** Final assistant text when done. */
   text?: string;
   reason?: string;
+  /** Scrubbed provider diagnostic when the submission ended unanswered. */
+  detail?: string;
 }
 
 /** One row of the console's chat feed for a conversation. */
 export type ChatItem = {
+  id: string;
   role: "user" | "agent" | "tool";
   text: string;
   /** Envelope sender handle for user rows ("operator", another agent's name). */
@@ -150,22 +169,50 @@ const DEFAULT_MEMORY_MD = (name: string) =>
   `# ${name}\n\nLong-term memory for this agent. Add durable facts here as you learn them.\n`;
 
 export class DurableDaemon {
+  readonly stateDir: string;
+  readonly workspacesDir: string;
+  readonly deliveriesDir: string;
+  readonly transcriptsDir: string;
+  private readonly storage: Storage;
+  readonly harness: Harness;
+  readonly registry: Registry;
+  private readonly transport: OutboxTransport;
+  private readonly opts: Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions;
+  /** How many model providers were installed at open (0 = every turn fails no_model). */
+  readonly providerCount: number;
+
   private constructor(
-    readonly stateDir: string,
-    readonly workspacesDir: string,
-    readonly deliveriesDir: string,
-    readonly transcriptsDir: string,
-    private readonly storage: Storage,
-    readonly harness: Harness,
-    readonly registry: Registry,
-    private readonly transport: OutboxTransport,
-    private readonly opts: Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions,
-    /** How many model providers were installed at open (0 = every turn fails no_model). */
-    readonly providerCount: number,
-  ) {}
+    stateDir: string,
+    workspacesDir: string,
+    deliveriesDir: string,
+    transcriptsDir: string,
+    storage: Storage,
+    harness: Harness,
+    registry: Registry,
+    transport: OutboxTransport,
+    opts: Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions,
+    providerCount: number,
+  ) {
+    this.stateDir = stateDir;
+    this.workspacesDir = workspacesDir;
+    this.deliveriesDir = deliveriesDir;
+    this.transcriptsDir = transcriptsDir;
+    this.storage = storage;
+    this.harness = harness;
+    this.registry = registry;
+    this.transport = transport;
+    this.opts = opts;
+    this.providerCount = providerCount;
+  }
 
   private readonly outcomeMigrations = new Map<string, Promise<void>>();
+  private providers: readonly Provider[] = [];
   private readonly outcomeReceiptsReady = new Set<string>();
+  private readonly initializedAgents = new Map<string, Promise<void>>();
+  private readonly maintenance = new Map<string, Promise<void>>();
+  private readonly pendingEmissions = new Set<Promise<void>>();
+  private resumePending: Promise<void> | undefined;
+  private resumed = false;
   private readonly outboxes = new Map<string, AgentOutbox>();
   private readonly pumps = new Map<string, { stop: () => Promise<unknown> }>();
   private readonly normalizers = new Map<string, DurableEventNormalizer>();
@@ -185,7 +232,7 @@ export class DurableDaemon {
     const workspacesDir = path.join(stateDir, "workspaces");
     const deliveriesDir = path.join(stateDir, DELIVERIES_DIR_NAME);
     const transcriptsDir = path.join(stateDir, "transcripts");
-    await mkdir(workspacesDir, { recursive: true });
+    await ensureWorkspaceRoot(workspacesDir);
     await mkdir(deliveriesDir, { recursive: true });
     await mkdir(transcriptsDir, { recursive: true });
 
@@ -200,7 +247,7 @@ export class DurableDaemon {
     const registry = createRegistry();
     registry.install(CodingTools);
     registry.install(RaftAgentExtension);
-    registry.install(MessagingExtension);
+    registry.install(createMessagingExtension((id, context) => storage.submission(id, context), options.messaging));
 
     const storage = await openNodeSqliteStorage(path.join(stateDir, "session.sqlite"));
     const harness = await Harness.open(
@@ -211,7 +258,7 @@ export class DurableDaemon {
         settings: options.settings,
         env: (target) => {
           const cwd = target.cwd ?? workspacesDir;
-          const env = new NodeExecutionEnv({ cwd });
+          const env = new ToolExecutionEnv({ cwd });
           trackToolChildren(env, stateDir);
           return env;
         },
@@ -236,6 +283,7 @@ export class DurableDaemon {
       resolved,
       providers.length,
     );
+    daemon.providers = providers;
     if (transport instanceof RoutingTransport) {
       transport.attach((envelope) => daemon.routeMessage(envelope));
     }
@@ -249,41 +297,47 @@ export class DurableDaemon {
    */
   async resume(): Promise<void> {
     this.assertOpen();
-    this.harness.resume();
-    for (const record of await this.listAgents()) {
-      const outbox = this.outboxFor(record.agentId);
-      await outbox.requeueInFlight();
-      await this.attachPump(record.agentId, record.conversationId);
-      await this.reconcileSubmissions(record);
-      await this.announceResume(record);
-    }
+    if (this.resumed) return;
+    if (!this.resumePending) this.resumePending = (async () => {
+      const records = await this.listAgents();
+      // Record recovery before any outbox routing or provider execution can
+      // restart work. This is a display/audit entry, never another submission.
+      for (const record of records) await this.announceResume(record);
+      for (const record of records) await this.resumeAgent(record);
+      this.harness.resume();
+      this.resumed = true;
+    })();
+    try { await this.resumePending; }
+    finally { this.resumePending = undefined; }
   }
 
-  /**
-   * Make the killer feature visible: an agent that had unfinished work when
-   * the host died gets a durable system notice — the chat feed shows the
-   * restart and the agent itself learns it was interrupted mid-turn.
-   */
   private async announceResume(record: AgentRecord): Promise<void> {
-    const pending = await this.pendingSubmissions(record);
-    if (pending === 0) return;
-    await this.postMessage(
-      record.agentId,
-      `Host restarted — resuming ${pending} unfinished submission(s). You may have been interrupted mid-work; check your workspace for partial output.`,
-      { systemNotice: true, requestId: `resume-notice:${record.agentId}:${Date.now()}` },
-    ).catch((err) => this.opts.onWarn?.(`resume notice failed for ${record.name}: ${err}`));
-  }
-
-  private async pendingSubmissions(record: AgentRecord): Promise<number> {
-    let count = 0;
+    const pending: string[] = [];
     const conversationId = Number(record.conversationId) as ConversationId;
     for (const status of ["queued", "placed"] as const) {
-      const page = await this.storage
-        .scanSubmissions({ conversationId, status }, 100, undefined, BACKGROUND_CONTEXT)
-        .catch(() => undefined);
-      count += page?.items.length ?? 0;
+      let cursor;
+      for (;;) {
+        const page = await this.storage.scanSubmissions({ conversationId, status }, 100, cursor, BACKGROUND_CONTEXT);
+        pending.push(...page.items.map((item) => String(item.id)));
+        if (page.next === undefined) break;
+        cursor = page.next;
+      }
     }
-    return count;
+    if (pending.length === 0) return;
+    pending.sort((a, b) => Number(a) - Number(b));
+    const epoch = JSON.stringify([record.agentId, pending]);
+    await this.harness.commit(async (tx) => {
+      const receipt = await tx.doc(RecoveryEpochDoc, epoch, epoch);
+      if (receipt.announced) return;
+      receipt.announced = true;
+      await tx.appendEntry(conversationId, {
+        kind: "raft.recovery",
+        data: {
+          epoch, pending, at: new Date().toISOString(),
+          text: `Host restarted — resuming ${pending.length} unfinished submission(s).`,
+        },
+      });
+    }, BACKGROUND_CONTEXT);
   }
 
   /**
@@ -307,6 +361,7 @@ export class DurableDaemon {
     for (const pump of this.pumps.values()) {
       await pump.stop().catch(() => {});
     }
+    await Promise.allSettled([...this.pendingEmissions]);
     for (const outbox of this.outboxes.values()) {
       outbox.stop();
     }
@@ -318,15 +373,13 @@ export class DurableDaemon {
 
   async createAgent(config: AgentConfigInput): Promise<CreateAgentResult> {
     this.assertOpen();
-    const model = config.model ?? this.opts.defaultModel;
-    if (!model) {
-      throw new Error("createAgent needs a model (or a daemon defaultModel)");
+    if (!config || typeof config !== "object") throw new AgentRegistryError("agent config must be an object", "invalid");
+    validateAgentName(config.name);
+    validateAgentSettings(config);
+    if (config.initialMemoryMd !== undefined && typeof config.initialMemoryMd !== "string") {
+      throw new AgentRegistryError("initialMemoryMd must be a string", "invalid");
     }
-    // "main" is the routing target for the operator inbox — an agent by that
-    // name would never receive peer-routed messages.
-    if (config.name === "main") {
-      throw new AgentRegistryError('"main" is reserved for the operator inbox — pick another name', "invalid");
-    }
+    const model = await validateModel(config.model ?? this.opts.defaultModel, this.providers);
     const agentId = `agent-${randomUUID().slice(0, 8)}`;
     const workspaceName = config.workspace ?? agentId;
     const workspacePath = resolveWorkspaceDirectoryPath(this.workspacesDir, workspaceName);
@@ -336,39 +389,16 @@ export class DurableDaemon {
     // Cheap pre-check so a taken name doesn't leave an orphan workspace +
     // conversation; the commit below re-checks (covers the race window).
     const existing = await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT);
-    if (Object.values(existing?.records ?? {}).some((r) => r.name === config.name)) {
+    if (Object.values(existing?.records ?? {}).some((r) => r.name === config.name || r.agentId === config.name)) {
       throw new AgentRegistryError(`agent name already in use: ${config.name}`, "name_taken");
     }
     const seedFiles: AgentWorkspaceSeedFile[] = [
       { relativePath: "notes/.gitkeep", content: "" },
     ];
-    let conversation;
-    try {
-      await initializeAgentWorkspace(workspacePath, config.initialMemoryMd ?? DEFAULT_MEMORY_MD(config.name), seedFiles);
-      conversation = await this.harness.createConversation(
-        {
-          ownership: { kind: "ownerless" },
-          agent: {
-            model,
-            instructions: config.instructions ?? null,
-            cwd: workspacePath,
-            thinkingLevel: config.thinkingLevel ?? null,
-          },
-          init: async (tx, conversationId) => {
-            (await tx.doc(AgentBindingDoc, conversationId)).agentId = agentId;
-          },
-        },
-        BACKGROUND_CONTEXT,
-      );
-    } catch (err) {
-      await deleteWorkspaceDirectory(this.workspacesDir, workspaceName).catch(() => false);
-      throw err;
-    }
-
     const now = new Date().toISOString();
     const record: AgentRecord = {
       agentId,
-      conversationId: String(conversation.id),
+      conversationId: "",
       name: config.name,
       model,
       instructions: config.instructions ?? null,
@@ -384,15 +414,27 @@ export class DurableDaemon {
       projectedSubmissions: [],
       outcomeReceiptsVersion: 1,
     };
+    let workspaceOwnership: WorkspaceOwnership | undefined;
+    let conversation;
     try {
-      await this.harness.commit(async (tx) => {
-        const doc = await tx.doc(AgentsDoc);
-        const nameTaken = Object.values(doc.records).some((r) => r.name === config.name && r.agentId !== agentId);
-        if (nameTaken) throw new AgentRegistryError(`agent name already in use: ${config.name}`, "name_taken");
-        doc.records[agentId] = record;
+      workspaceOwnership = await initializeAgentWorkspace(workspacePath, config.initialMemoryMd ?? DEFAULT_MEMORY_MD(config.name), seedFiles);
+      record.workspaceOwnership = workspaceOwnership;
+      // Registry and conversation creation share the same transaction. A
+      // racing name conflict leaves neither an orphan conversation nor a row.
+      conversation = await this.harness.createConversation({
+        ownership: { kind: "ownerless" },
+        agent: { model, instructions: record.instructions, cwd: workspacePath, thinkingLevel: config.thinkingLevel ?? null },
+        init: async (tx, conversationId) => {
+          const doc = await tx.doc(AgentsDoc);
+          const conflict = Object.values(doc.records).some((r) => r.name === config.name || r.agentId === config.name || r.name === agentId || r.agentId === agentId);
+          if (conflict) throw new AgentRegistryError(`agent name already in use: ${config.name}`, "name_taken");
+          (await tx.doc(AgentBindingDoc, conversationId)).agentId = agentId;
+          record.conversationId = String(conversationId);
+          doc.records[agentId] = record;
+        },
       }, BACKGROUND_CONTEXT);
     } catch (err) {
-      await deleteWorkspaceDirectory(this.workspacesDir, workspaceName).catch(() => false);
+      if (workspaceOwnership) await deleteWorkspaceDirectory(this.workspacesDir, workspaceName, workspaceOwnership).catch(() => false);
       throw err;
     }
 
@@ -418,7 +460,7 @@ export class DurableDaemon {
   async getAgent(agentIdOrName: string): Promise<AgentRecord> {
     const state = await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT);
     const record =
-      state?.records[agentIdOrName] ??
+      (Object.hasOwn(state?.records ?? {}, agentIdOrName) ? state?.records[agentIdOrName] : undefined) ??
       Object.values(state?.records ?? {}).find((r) => r.name === agentIdOrName);
     if (!record) throw new AgentRegistryError(`no such agent: ${agentIdOrName}`, "not_found");
     return record;
@@ -428,24 +470,35 @@ export class DurableDaemon {
     agentIdOrName: string,
     change: Partial<Pick<AgentRecord, "name" | "instructions" | "model" | "thinkingLevel">>,
   ): Promise<AgentRecord> {
+    this.assertOpen();
+    if (!change || typeof change !== "object" || Array.isArray(change)) throw new AgentRegistryError("agent update must be an object", "invalid");
+    const allowed = new Set(["name", "instructions", "model", "thinkingLevel"]);
+    if (Object.keys(change).some((key) => !allowed.has(key))) throw new AgentRegistryError("unsupported agent update field", "invalid");
+    if (change.name !== undefined) validateAgentName(change.name);
+    validateAgentSettings(change);
+    const model = change.model === undefined ? undefined : await validateModel(change.model, this.providers);
     const record = await this.getAgent(agentIdOrName);
-    const updated: AgentRecord = { ...record, ...change, updatedAt: new Date().toISOString() };
+    let updated!: AgentRecord;
     await this.harness.commit(async (tx) => {
       const doc = await tx.doc(AgentsDoc);
+      const current = doc.records[record.agentId];
+      if (!current) throw new AgentRegistryError(`no such agent: ${agentIdOrName}`, "not_found");
+      if (change.name !== undefined && Object.values(doc.records).some((r) => r.agentId !== record.agentId && (r.name === change.name || r.agentId === change.name))) {
+        throw new AgentRegistryError(`agent name already in use: ${change.name}`, "name_taken");
+      }
+      updated = { ...current, updatedAt: new Date().toISOString() };
+      if (change.name !== undefined) updated.name = change.name;
+      if (change.instructions !== undefined) updated.instructions = change.instructions;
+      if (change.thinkingLevel !== undefined) updated.thinkingLevel = change.thinkingLevel;
+      if (model !== undefined) updated.model = model;
+      await configure(tx, Number(record.conversationId) as ConversationId, {
+        ...(model !== undefined ? { model } : {}),
+        ...(change.instructions !== undefined ? { instructions: change.instructions } : {}),
+        ...(change.thinkingLevel !== undefined ? { thinkingLevel: change.thinkingLevel as "minimal" | "low" | "medium" | "high" | null } : {}),
+      });
       doc.records[record.agentId] = updated;
     }, BACKGROUND_CONTEXT);
-    const conversation = await this.requireConversation(record);
-    await conversation.configure(
-      {
-        ...(change.model !== undefined ? { model: change.model } : {}),
-        ...(change.instructions !== undefined ? { instructions: change.instructions } : {}),
-        ...(change.thinkingLevel !== undefined
-          ? { thinkingLevel: change.thinkingLevel as "minimal" | "low" | "medium" | "high" | null }
-          : {}),
-      },
-      BACKGROUND_CONTEXT,
-    );
-    return updated;
+    return this.getAgent(record.agentId);
   }
 
   /** Host stop: abort live work and mark the record stopped. */
@@ -466,12 +519,16 @@ export class DurableDaemon {
   /** Host start: clear the stopped/terminal override so the agent accepts work. */
   async startAgent(agentIdOrName: string): Promise<void> {
     const record = await this.getAgent(agentIdOrName);
+    // Flush a settlement whose event callback has not projected yet before
+    // recording the human decision; it must not undo start a moment later.
+    await this.reconcileSubmissions(record);
     await this.harness.commit(async (tx) => {
       const doc = await tx.doc(AgentsDoc);
       const rec = doc.records[record.agentId];
       if (rec) {
         rec.override = null;
         rec.terminalFailure = null;
+        if (rec.lastOutcome) rec.resolvedSubmissionId = rec.lastOutcome.submissionId;
         rec.updatedAt = new Date().toISOString();
       }
     }, BACKGROUND_CONTEXT);
@@ -499,14 +556,18 @@ export class DurableDaemon {
     await this.harness.commit(async (tx) => {
       const doc = await tx.doc(AgentsDoc);
       delete doc.records[record.agentId];
+      const reminders = await tx.doc(RemindersDoc);
+      reminders.timers = reminders.timers.filter((timer) => timer.agentId !== record.agentId);
       await tx.retireDoc(OutboxDoc, record.agentId);
     }, BACKGROUND_CONTEXT);
+    this.reminderHook?.();
     // Agent evidence lives on disk too — remove the transcript + delivery
     // ledger so a deleted agent doesn't leave unbounded files behind.
     await rm(this.transcriptPath(record.agentId), { force: true }).catch(() => {});
     await rm(path.join(this.deliveriesDir, `${record.agentId}.jsonl`), { force: true }).catch(() => {});
     if (opts.deleteWorkspace) {
-      await deleteWorkspaceDirectory(this.workspacesDir, path.basename(record.workspacePath));
+      const removed = await deleteWorkspaceDirectory(this.workspacesDir, path.basename(record.workspacePath), record.workspaceOwnership);
+      if (!removed) this.opts.onWarn?.(`workspace preserved: ownership could not be verified for ${record.workspacePath}`);
     }
   }
 
@@ -524,46 +585,42 @@ export class DurableDaemon {
   ): Promise<{ submissionId: string }> {
     const record = await this.getAgent(agentIdOrName);
     if (record.override === "stopped") {
-      throw new AgentRegistryError(`agent ${record.agentId} is stopped`, "not_found");
+      throw new AgentRegistryError(`agent ${record.agentId} is stopped`, "conflict");
     }
-    const conversation = await this.requireConversation(record);
-    await this.resumeAgent(record);
-    if (this.opts.compactOnWakeMs) {
-      const last = this.lastActivity.get(record.agentId);
-      if (last !== undefined && Date.now() - last > this.opts.compactOnWakeMs) {
-        await this.compact(record.agentId, "Recycled cold context: the agent was idle; keep only what matters for continuing this work.")
-          .catch((err) => this.opts.onWarn?.(`wake-compact failed for ${record.name}: ${err}`));
-      }
+    if (await this.outboxFor(record.agentId).isUnreliable()) {
+      throw new OutboxError(`agent ${record.agentId} outbox is unreliable; use resolve before sending more work`, "unreliable");
     }
-    this.lastActivity.set(record.agentId, Date.now());
+    if (record.terminalFailure || unresolvedFailure(record)) {
+      throw new AgentRegistryError(`agent ${record.agentId} needs start or resolve before accepting more work`, "conflict");
+    }
+    if (options.execute !== false) await this.resumeAgent(record);
+    const requestId = options.requestId ?? `input:${randomUUID()}`;
+    const messageChain = await this.harness.commit(async (tx) => {
+      const context = await tx.doc(MessageContextDoc, Number(record.conversationId) as ConversationId, requestId, requestId);
+      context.value ??= options.messageChain ?? { chainId: `chain:${randomUUID()}`, hop: 0 };
+      return { ...context.value };
+    }, BACKGROUND_CONTEXT);
     let content: string;
-    if (typeof input === "string") {
-      content = options.raw
-        ? formatOperatorInput(input)
-        : formatConcreteMessagesRuntimeInput([
-            {
-              message_id: `local-${randomUUID()}`,
-              timestamp: new Date().toISOString(),
-              sender_name: "operator",
-              sender_type: "user",
-              target: record.name,
-              content: input,
-            },
-          ]);
+    if (typeof input === "string" && options.raw && !options.systemNotice) {
+      content = formatOperatorInput(input);
     } else {
-      const messages: readonly IncomingMessage[] = Array.isArray(input) ? input : [input];
-      const first = messages[0];
-      if (!first) throw new Error("postMessage needs at least one message");
-      content =
-        options.systemNotice === true && messages.length === 1
-          ? formatSystemNoticeRuntimeInput(first)
-          : formatConcreteMessagesRuntimeInput(messages);
+      const messages: readonly IncomingMessage[] = typeof input === "string" ? [{
+        message_id: `local-${randomUUID()}`,
+        timestamp: new Date().toISOString(),
+        sender_name: options.systemNotice ? "system" : "operator",
+        sender_type: options.systemNotice ? "system" : "user",
+        target: record.name,
+        reply_to: "main",
+        chain_id: messageChain.chainId,
+        hop: messageChain.hop,
+        content: input,
+      }] : Array.isArray(input) ? input : [input];
+      if (!messages.length) throw new Error("postMessage needs at least one message");
+      content = options.systemNotice && messages.length === 1
+        ? formatSystemNoticeRuntimeInput({ ...messages[0]!, sender_name: "system", sender_type: "system", reply_to: "main" })
+        : formatConcreteMessagesRuntimeInput(messages);
     }
-    const submission = await conversation.submit(
-      { type: "input", content, whenBusy: options.whenBusy, requestId: options.requestId },
-      BACKGROUND_CONTEXT,
-    );
-    return { submissionId: String(submission.id) };
+    return this.submitMessage(record, content, { ...options, requestId });
   }
 
   /** Wait for one submission's settlement and read back the answer text. */
@@ -614,11 +671,26 @@ export class DurableDaemon {
       }, BACKGROUND_CONTEXT);
       return;
     }
+    const messageChain: MessageChain = { chainId: frame.chainId ?? `legacy-route:${frame.agentId}:${frame.msgId}`, hop: frame.hop ?? 1 };
+    const blocked = await this.harness.commit(async (tx) => {
+      const chain = await tx.doc(MessageChainDoc, messageChain.chainId, messageChain.chainId);
+      if (messageChain.hop > messagingLimits(this.opts.messaging).maxHops) chain.blocked ??= "hop limit reached";
+      if (!chain.blocked) return false;
+      if (!chain.notified) {
+        const inbox = await tx.doc(MainInboxDoc);
+        inbox.entries.push({ id: `limit:${messageChain.chainId}`, fromAgentId: "system", fromName: "system",
+          text: `Messaging stopped for chain ${messageChain.chainId}: ${chain.blocked}.`, at: new Date().toISOString() });
+        if (inbox.entries.length > 1000) inbox.entries.splice(0, inbox.entries.length - 1000);
+        chain.notified = true;
+      }
+      return true;
+    }, BACKGROUND_CONTEXT);
+    if (blocked) return;
     const bounce = async (why: string) => {
       await this.postMessage(
         frame.agentId,
         `Delivery failed: ${why}. Your message was not delivered.`,
-        { systemNotice: true, requestId: `route-bounce:${frame.agentId}:${envelope.clientSeq}` },
+        { systemNotice: true, requestId: `route-bounce:${frame.agentId}:${envelope.clientSeq}`, messageChain },
       ).catch(() => {});
     };
     const target = await this.getAgent(frame.to).catch(() => undefined);
@@ -632,17 +704,20 @@ export class DurableDaemon {
     }
     try {
       await this.postMessage(
-      target.agentId,
-      {
-        message_id: `route-${frame.msgId}`,
-        timestamp: frame.at,
-        sender_name: fromName,
-        sender_type: "agent",
-        target: target.name,
-        content: frame.content,
-      },
-      { requestId: `route:${frame.agentId}:${envelope.clientSeq}` },
-    );
+        target.agentId,
+        {
+          message_id: `route-${frame.msgId}`,
+          timestamp: frame.at,
+          sender_name: fromName,
+          sender_type: "agent",
+          target: target.name,
+          reply_to: frame.agentId,
+          chain_id: messageChain.chainId,
+          hop: messageChain.hop,
+          content: frame.content,
+        },
+        { requestId: `route:${frame.agentId}:${envelope.clientSeq}`, messageChain },
+      );
     } catch (err) {
       // Permanent target-side failures (stopped / deleted / unreliable
       // outbox) must bounce — retransmitting wedges the sender's outbox
@@ -660,16 +735,18 @@ export class DurableDaemon {
   /** Commit a durable reminder row; ReminderService arms the setTimeout. */
   async remind(agentIdOrName: string, spec: string, text: string): Promise<Reminder> {
     const record = await this.getAgent(agentIdOrName);
-    const { dueAt, everyMs } = parseWhen(spec);
+    const { dueAt, everyMs, timeZone } = parseWhen(spec);
     const reminder: Reminder = {
       id: `rem-${randomUUID().slice(0, 8)}`,
       agentId: record.agentId,
       text,
       dueAt,
       everyMs,
+      timeZone,
       createdAt: new Date().toISOString(),
     };
     await this.harness.commit(async (tx) => {
+      if (!(await tx.doc(AgentsDoc)).records[record.agentId]) throw new AgentRegistryError(`agent ${record.agentId} was deleted`, "not_found");
       const doc = await tx.doc(RemindersDoc);
       doc.timers.push(reminder);
     }, BACKGROUND_CONTEXT);
@@ -703,40 +780,44 @@ export class DurableDaemon {
   async chatFeed(agentIdOrName: string, limit = 200): Promise<ChatItem[]> {
     const record = await this.getAgent(agentIdOrName);
     const conversationId = Number(record.conversationId) as ConversationId;
+    const count = Math.max(0, Math.min(1000, Math.floor(limit)));
+    if (!Number.isFinite(count) || count === 0) return [];
+    // Entries are newest-first, but messages within one entry are in their
+    // original order. Reverse each entry while collecting, then reverse once.
     const items: ChatItem[] = [];
     let cursor;
     for (;;) {
-      const page = await this.storage.scanEntries({ conversationId }, 500, cursor, BACKGROUND_CONTEXT);
+      const page = await this.storage.scanEntries({ conversationId }, Math.min(100, count), cursor, BACKGROUND_CONTEXT);
       for (const entry of page.items) {
-        for (const m of entry.model ?? []) {
+        const row: ChatItem[] = [];
+        if (entry.kind === "raft.recovery" && entry.data && typeof entry.data === "object" && "text" in entry.data) {
+          row.push({ id: `${entry.id}:recovery`, role: "user", from: "system", text: String(entry.data.text) });
+        }
+        for (const [index, m] of (entry.model ?? []).entries()) {
+          const id = `${entry.id}:${index}`;
           if (m.role === "user") {
             const raw = messageText(m.content);
-            // Strip the [target=…] envelope so the console shows what was meant;
-            // indented continuation lines belong to the body, trailers don't.
-            const env = raw.match(/\[target=[^\]]*\] @([\w.-]+): ([^\n]*)\n?((?: {2}[^\n]*\n?)*)/);
-            const text = env ? env[2] + (env[3] ? "\n" + env[3].split("\n").map((l) => l.replace(/^ {2}/, "")).join("\n").trimEnd() : "") : raw;
-            items.push({ role: "user", text, ...(env ? { from: env[1] } : {}) });
+            const envelope = parseIncomingEnvelope(raw);
+            row.push({ id, role: "user", text: envelope?.text ?? raw, ...(envelope ? { from: envelope.from } : {}) });
           } else if (m.role === "assistant") {
             const text = m.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n");
             const thinking = m.content.filter((c) => c.type === "thinking").map((c) => (c as { thinking: string }).thinking).join("\n");
-            const toolCalls = m.content
-              .filter((c) => c.type === "toolCall")
-              .map((c) => {
-                const t = c as { id: string; name: string; arguments: unknown };
-                return { id: t.id, name: t.name, args: JSON.stringify(t.arguments).slice(0, 300) };
-              });
-            items.push({ role: "agent", text, ...(thinking ? { thinking } : {}), ...(toolCalls.length ? { toolCalls } : {}) });
+            const toolCalls = m.content.filter((c) => c.type === "toolCall").map((c) => {
+              const t = c as { id: string; name: string; arguments: unknown };
+              return { id: t.id, name: t.name, args: JSON.stringify(t.arguments).slice(0, 300) };
+            });
+            row.push({ id, role: "agent", text, ...(thinking ? { thinking } : {}), ...(toolCalls.length ? { toolCalls } : {}) });
           } else if (m.role === "toolResult") {
             const t = m as { toolName: string; content: unknown; isError: boolean };
-            items.push({ role: "tool", name: t.toolName, text: messageText(t.content).slice(0, 500), isError: t.isError });
+            row.push({ id, role: "tool", name: t.toolName, text: messageText(t.content).slice(0, 500), isError: t.isError });
           }
         }
+        items.push(...row.reverse());
+        if (items.length >= count) return items.slice(0, count).reverse();
       }
-      if (page.next === undefined) break;
+      if (page.next === undefined) return items.reverse();
       cursor = page.next;
     }
-    // scanEntries returns newest-first; the console wants chat order.
-    return items.reverse().slice(-limit);
   }
 
   /** All durable submissions admitted on an agent's conversation, any status. */
@@ -813,7 +894,7 @@ export class DurableDaemon {
   async lifecycle(agentIdOrName: string): Promise<AgentLifecycleRecord> {
     const record = await this.getAgent(agentIdOrName);
     const view = await this.conversationView(record).catch(() => undefined);
-    return projectLifecycle(record, view);
+    return projectLifecycle(record, view, await this.outboxFor(record.agentId).isUnreliable());
   }
 
   async outboxState(agentIdOrName: string): Promise<Readonly<OutboxDocState> | undefined> {
@@ -821,7 +902,11 @@ export class DurableDaemon {
     return this.outboxFor(record.agentId).state();
   }
 
-  async usage() {
+  async usage(agentIdOrName?: string) {
+    if (agentIdOrName !== undefined) {
+      const record = await this.getAgent(agentIdOrName);
+      return await this.harness.snapshot(UsageDoc, Number(record.conversationId) as ConversationId, BACKGROUND_CONTEXT) ?? { models: {}, tools: {} };
+    }
     return this.harness.usage(BACKGROUND_CONTEXT);
   }
 
@@ -854,12 +939,50 @@ export class DurableDaemon {
     return outbox;
   }
 
-  /** Lazily start scheduling + this agent's pump/outbox without a full resume(). */
+  /** Attach before the first admission. Recovery scans once per process;
+   * the live pump observes every later settlement, including old IDs that
+   * settle after newer ones. A maximum-ID watermark would lose those. */
   private async resumeAgent(record: AgentRecord): Promise<void> {
-    this.harness.resume();
-    await this.outboxFor(record.agentId).requeueInFlight();
-    await this.attachPump(record.agentId, record.conversationId);
-    await this.reconcileSubmissions(record);
+    let pending = this.initializedAgents.get(record.agentId);
+    if (!pending) {
+      pending = (async () => {
+        await this.attachPump(record.agentId, record.conversationId);
+        await this.outboxFor(record.agentId).requeueInFlight();
+        await this.reconcileSubmissions(record);
+      })();
+      this.initializedAgents.set(record.agentId, pending);
+    }
+    try { await pending; }
+    catch (error) {
+      if (this.initializedAgents.get(record.agentId) === pending) this.initializedAgents.delete(record.agentId);
+      throw error;
+    }
+  }
+
+  private async submitMessage(record: AgentRecord, content: string, options: PostMessageOptions): Promise<{ submissionId: string }> {
+    const conversationId = Number(record.conversationId) as ConversationId;
+    if (options.execute === false) {
+      const id = await enqueueInput(this.harness, conversationId, content, options);
+      return { submissionId: String(id) };
+    }
+    const conversation = await this.requireConversation(record);
+    const submission = await conversation.submit(
+      { type: "input", content, whenBusy: options.whenBusy, requestId: options.requestId }, BACKGROUND_CONTEXT,
+    );
+    // Cold-wake maintenance is admitted only after the message is durable,
+    // and never delays steering, route acknowledgement, or stop requests.
+    const last = this.lastActivity.get(record.agentId);
+    this.lastActivity.set(record.agentId, Date.now());
+    if (this.opts.compactOnWakeMs && last !== undefined && Date.now() - last > this.opts.compactOnWakeMs
+      && options.whenBusy !== "steer" && !this.maintenance.has(record.agentId)) {
+      const task = Promise.resolve().then(async () => {
+        if (this.closed) return;
+        await this.compact(record.agentId, "Recycled cold context: keep only what matters for continuing this work.");
+      }).catch((error) => this.opts.onWarn?.(`wake-compact failed for ${record.name}: ${error}`))
+        .finally(() => { this.maintenance.delete(record.agentId); });
+      this.maintenance.set(record.agentId, task);
+    }
+    return { submissionId: String(submission.id) };
   }
 
   private async requireConversation(record: AgentRecord): Promise<Conversation> {
@@ -881,7 +1004,11 @@ export class DurableDaemon {
   private async readAnswer(settled: SubmissionRecord): Promise<Answer> {
     const base = { submissionId: String(settled.id), status: settled.status } as Answer;
     if (settled.status !== "done" || settled.type !== "input") {
-      return { ...base, reason: settled.status === "unanswered" ? settled.reason : undefined };
+      if (settled.status !== "unanswered") return base;
+      const detail = settled.detail === undefined ? undefined : scrubRuntimeErrorDiagnosticText(
+        typeof settled.detail === "string" ? settled.detail : JSON.stringify(settled.detail),
+      ).slice(0, 512);
+      return { ...base, reason: settled.reason, ...(detail ? { detail } : {}) };
     }
     const looked = await this.storage.entry(settled.conversationId, settled.answer, BACKGROUND_CONTEXT).catch(() => undefined);
     const entry = looked?.entry;
@@ -923,33 +1050,37 @@ export class DurableDaemon {
         return;
       }
 
-      const emit = async (events: ParsedEvent[]) => {
-      for (const event of events) {
-        try {
-          this.opts.onEvent?.(agentId, event);
-        } catch (err) {
-          // A throwing listener must not kill the CommittedWatch — the pump
-          // would freeze silently and outcomes would stop being produced.
-          this.opts.onWarn?.(`onEvent listener threw for ${agentId}: ${err}`);
-        }
-        await appendFile(transcript, JSON.stringify(event) + "\n", "utf8").catch(() => {});
-        if (event.kind === "submission_settled") {
-          // produceOutcome commits on the Session line; schedule it outside the
-          // watch listener so the listener never re-enters it. Counters are
-          // snapshotted now, before a run_end in the same batch resets them.
-          const captured = event;
-          const counters = { ...normalizer.outcomeCounters };
-          const sticky = normalizer.stickyTerminalFailure;
-          const firstError = normalizer.firstErrorText;
-          setImmediate(() => {
+      const emit = (events: ParsedEvent[]) => {
+        const pending = (async () => {
+          for (const event of events) {
             if (this.closed) return;
-            void this.produceOutcome(agentId, captured, { counters, sticky, firstError }).catch((err) =>
-              console.error(`[outbox] ${agentId} outcome append failed:`, err),
-            );
-          });
-        }
-      }
-    };
+            try {
+              this.opts.onEvent?.(agentId, event);
+            } catch (err) {
+              // A throwing listener must not kill the CommittedWatch.
+              this.opts.onWarn?.(`onEvent listener threw for ${agentId}: ${err}`);
+            }
+            await appendFile(transcript, JSON.stringify(event) + "\n", "utf8").catch(() => {});
+            if (event.kind === "submission_settled") {
+              // A watch listener cannot re-enter the Session line. Capture
+              // counters before run_end in the same batch resets them.
+              const captured = event;
+              const counters = { ...normalizer.outcomeCounters };
+              const sticky = normalizer.stickyTerminalFailure;
+              const firstError = normalizer.firstErrorText;
+              setImmediate(() => {
+                if (this.closed) return;
+                void this.produceOutcome(agentId, captured, { counters, sticky, firstError }).catch((err) =>
+                  console.error(`[outbox] ${agentId} outcome append failed:`, err),
+                );
+              });
+            }
+          }
+        })();
+        this.pendingEmissions.add(pending);
+        void pending.then(() => this.pendingEmissions.delete(pending), () => this.pendingEmissions.delete(pending));
+        return pending;
+      };
 
       const initial = normalizer.normalizeSnapshot(stream.snapshot, conversationId);
       await emit(initial);
@@ -978,34 +1109,13 @@ export class DurableDaemon {
     await this.ensureOutcomeReceipts(agentId);
     let outcome;
     if (settled.status === "done") {
-      const counters = run?.counters ?? { textEvents: 0, toolCalls: 0, runtimeErrors: 0 };
-      const sticky = run?.sticky ?? false;
-      outcome = turnCompletedOutcome(counters, sticky);
-      if (!outcome) {
-        // Never fabricate a clean turn when evidence says otherwise (sticky
-        // terminal failure / runtime errors) — emit honest terminal_failure;
-        // a done submission with zero observed output reports real 0/0
-        // counters rather than an invented textEvents:1.
-        if (sticky || counters.runtimeErrors > 0) {
-          const evidence = terminalFailureFromRawText(
-            "sticky_runtime_error",
-            run?.firstError ?? "turn ended with runtime errors",
-          );
-          outcome = {
-            kind: "terminal_failure" as const,
-            failureKind: evidence.failureKind,
-            fingerprint: evidence.fingerprint,
-            errorClass: evidence.errorClass,
-            errorReason: evidence.errorReason,
-            errorAction: evidence.errorAction,
-            detail: evidence.detail,
-          };
-        } else {
-          outcome = { kind: "turn_completed" as const, textEvents: counters.textEvents, toolCalls: counters.toolCalls };
-        }
-      }
+      // Attempt errors remain telemetry; they cannot turn an authoritative
+      // successful settlement into a terminal_failure frame.
+      outcome = turnCompletedOutcome(run?.counters ?? { textEvents: 0, toolCalls: 0, runtimeErrors: 0 });
     } else {
-      const raw = run?.firstError ?? settled.reason ?? "submission unanswered";
+      const raw = settled.reason === "aborted" ? "operation aborted"
+        : settled.reason === "no_model" ? "configured model not found; select an installed provider/model"
+        : run?.firstError ?? settled.reason ?? "submission unanswered";
       const evidence = terminalFailureFromRawText(failureKindFor(settled.reason), raw);
       outcome = {
         kind: "terminal_failure" as const,
@@ -1044,6 +1154,7 @@ export class DurableDaemon {
           errorClass: outcome.kind === "terminal_failure" ? outcome.errorClass : null,
           at: new Date().toISOString(),
         };
+        if (outcome.kind === "turn_completed" || settled.reason === "aborted") record.terminalFailure = null;
         if (outcome.kind === "terminal_failure" && outcome.errorAction !== null && outcome.errorAction !== "none") {
           record.terminalFailure = {
             failureKind: outcome.failureKind,
@@ -1224,38 +1335,6 @@ function failureKindFor(reason: string | undefined): TerminalFailureKind {
   if (/input.*too.*large|context.*too.*long|InputTooLargeError/i.test(text)) return "compaction_input_too_large";
   if (/compaction/i.test(text)) return "compaction_failed";
   return "sticky_runtime_error";
-}
-
-/**
- * Pick a default model from the actually-configured providers (issue: a
- * hardcoded GLM default meant `export OPENAI_API_KEY` alone created agents
- * that always answered no_model). Preference order first, then the first
- * model in the first provider's catalog.
- */
-function pickDefaultModel(providers: readonly Provider[]): AgentModelRef | undefined {
-  const preferred: Record<string, string> = {
-    "zai-coding-cn": "glm-5.3-flash",
-  };
-  for (const p of providers) {
-    const want = preferred[p.id];
-    if (!want) continue;
-    try {
-      if (p.getModels().some((m) => m.id === want)) {
-        return { provider: p.id, modelId: want };
-      }
-    } catch {
-      /* catalog unreadable */
-    }
-  }
-  for (const p of providers) {
-    try {
-      const first = p.getModels()[0];
-      if (first) return { provider: p.id, modelId: first.id };
-    } catch {
-      /* catalog unreadable */
-    }
-  }
-  return undefined;
 }
 
 /**

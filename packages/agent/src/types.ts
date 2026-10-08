@@ -59,6 +59,10 @@ export type IncomingMessage = {
   target: string;
   content: string;
   seq?: number;
+  /** Explicit send_message reply destination, distinct from this recipient. */
+  reply_to?: string;
+  chain_id?: string;
+  hop?: number;
   thread_join_context?: {
     parent_target: string;
     thread_target: string;
@@ -72,7 +76,7 @@ export type IncomingMessage = {
 // ---------- outbox frames (stored inside the outbox doc → strict JSON) ----------
 
 export type AgentRuntimeOutcome =
-  | { kind: "turn_completed"; textEvents: number; toolCalls: number }
+  | { kind: "turn_completed"; textEvents: number; toolCalls: number; recoveredErrors?: number }
   | {
       kind: "terminal_failure";
       failureKind: TerminalFailureKind;
@@ -123,6 +127,9 @@ export type OutboxFrame =
       to: string;
       content: string;
       at: string;
+      /** Durable conversation chain; legacy queued frames may omit it. */
+      chainId?: string;
+      hop?: number;
     };
 
 // ---------- agent registry (session doc "raft.agents") ----------
@@ -155,6 +162,8 @@ export type AgentRecord = {
   instructions: string | null;
   workspacePath: string;
   conversationId: string;
+  /** Only directories created and still owned by this agent may be removed. */
+  workspaceOwnership?: { token: string; device: string; inode: string };
   thinkingLevel: string | null;
   createdAt: string;
   updatedAt: string;
@@ -180,6 +189,8 @@ export type AgentRecord = {
   projectedSubmissions: string[];
   /** Versioned migration marker; authoritative dedupe lives in per-outcome docs. */
   outcomeReceiptsVersion?: number;
+  /** Last outcome explicitly cleared by start/resolve; retained for audit. */
+  resolvedSubmissionId?: string;
 };
 
 export type AgentsDocState = {
