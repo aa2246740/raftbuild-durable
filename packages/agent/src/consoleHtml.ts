@@ -29,7 +29,21 @@ export const CONSOLE_HTML = `<!doctype html>
   .feed-item { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:8px; font-size:13px; }
   .feed-item .who { color:var(--acc); font-weight:600; margin-bottom:2px; }
   .feed-item .at { color:var(--mut); font-size:11px; }
+  #err { display:none; position:fixed; top:52px; left:50%; transform:translateX(-50%); background:var(--bad); color:#fff; padding:8px 16px; border-radius:8px; font-size:13px; z-index:9; max-width:80%; }
   #chat { flex:1; display:flex; flex-direction:column; min-width:0; }
+  @media (max-width: 700px) {
+    main { flex-direction:column; }
+    #sidebar { width:auto; border-right:none; border-bottom:1px solid var(--line); max-height:32vh; }
+    #content { flex-direction:column; min-height:0; }
+    #feed { width:auto; border-right:none; border-bottom:1px solid var(--line); max-height:30vh; }
+    #chat { min-height:0; flex:1; }
+    /* Composer wraps to two rows on phones: message input gets the full
+       width, mode select + Send share the second row — nothing overflows. */
+    #composer { flex-wrap:wrap; }
+    #composer input { order:-1; flex:1 1 100%; }
+    #composer select { flex:1 1 60%; min-width:0; }
+    #composer button { flex:1 1 30%; }
+  }
   #chat-head { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
   #chat-head .t { font-weight:600; }
   #events { flex:1; overflow-y:auto; padding:16px; font-size:13.5px; }
@@ -46,7 +60,7 @@ export const CONSOLE_HTML = `<!doctype html>
   .tc { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--warn); margin-top:5px; }
   .tk { font-size:12px; color:var(--mut); font-style:italic; margin-top:5px; border-left:2px solid var(--line); padding-left:8px; }
   #composer { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
-  #composer input { flex:1; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 12px; font:inherit; }
+  #composer input { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 12px; font:inherit; }
   #composer select, button { background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 14px; font:inherit; cursor:pointer; }
   button.primary { background:var(--acc); border-color:var(--acc); color:#0d1117; font-weight:600; }
   button:hover { filter:brightness(1.15); }
@@ -61,6 +75,7 @@ export const CONSOLE_HTML = `<!doctype html>
 </style>
 </head>
 <body>
+<div id="err"></div>
 <header>
   <span class="dot"></span><b>raftd</b>
   <span class="small" id="usage"></span>
@@ -194,24 +209,38 @@ function renderItem(e) {
   return '<div class="row agent"><div class="who">' + 'agent</div><div class="body">' + inner + '</div></div>';
 }
 
+function showErr(msg) {
+  const el = $('err');
+  el.textContent = msg || 'unknown error';
+  el.style.display = 'block';
+  clearTimeout(showErr._t);
+  showErr._t = setTimeout(() => { el.style.display = 'none'; }, 8000);
+}
+
 async function send() {
   const text = $('msg').value.trim(); if (!text || !sel) return;
-  $('msg').value = '';
-  await api('agents/' + encodeURIComponent(sel) + '/messages', 'POST', { text, whenBusy: $('whenbusy').value || undefined });
-  setTimeout(refresh, 800);
+  // Clear the input only after the API accepted it — a rejected send keeps
+  // the user's text and surfaces the error (stopped agent, 401, network).
+  try {
+    await api('agents/' + encodeURIComponent(sel) + '/messages', 'POST', { text, whenBusy: $('whenbusy').value || undefined });
+    $('msg').value = '';
+    setTimeout(refresh, 800);
+  } catch (e) { showErr(e.message || String(e)); }
 }
 async function createAgent() {
   const name = $('na-name').value.trim(); if (!name) return;
-  await api('agents', 'POST', { name, instructions: $('na-inst').value.trim() || undefined });
-  $('na-name').value=''; $('na-inst').value=''; refresh();
+  try {
+    await api('agents', 'POST', { name, instructions: $('na-inst').value.trim() || undefined });
+    $('na-name').value=''; $('na-inst').value=''; refresh();
+  } catch (e) { showErr(e.message || String(e)); }
 }
-async function agentAction(a) { if (!sel) return; await api('agents/' + sel + '/' + a, 'POST'); refresh(); }
-async function delAgent() { if (!sel || !confirm('delete agent?')) return; await api('agents/' + sel + '?workspace=true', 'DELETE'); sel=null; refresh(); }
+async function agentAction(a) { if (!sel) return; try { await api('agents/' + sel + '/' + a, 'POST'); refresh(); } catch (e) { showErr(e.message || String(e)); } }
+async function delAgent() { if (!sel || !confirm('delete agent?')) return; try { await api('agents/' + sel + '?workspace=true', 'DELETE'); sel=null; refresh(); } catch (e) { showErr(e.message || String(e)); } }
 async function setReminder() {
   const agent=$('rm-agent').value.trim(), when=$('rm-when').value.trim(), text=$('rm-text').value.trim();
   if (!agent||!when||!text) return;
   try { await api('reminders', 'POST', {agent, when, text}); $('rm-when').value=''; $('rm-text').value=''; refresh(); }
-  catch(e){ alert(e.message); }
+  catch(e){ showErr(e.message); }
 }
 async function delReminder(id){ await api('reminders/'+id, 'DELETE'); refresh(); }
 

@@ -1,4 +1,4 @@
-export { DurableDaemon, type DurableDaemonOptions, type CreateAgentResult, type PostMessageOptions, type Answer } from "./daemon.ts";
+export { DurableDaemon, trackToolChildren, type DurableDaemonOptions, type CreateAgentResult, type PostMessageOptions, type Answer } from "./daemon.ts";
 export { AgentOutbox, OutboxDoc, OutboxError, retransmitDelayMs, OUTBOX_NORMAL_CAP } from "./outbox.ts";
 export { AgentsDoc, AgentRegistryError } from "./agents.ts";
 export { projectLifecycle, type AgentLifecycleRecord } from "./lifecycle.ts";
@@ -54,6 +54,6 @@ export { RaftAgentExtension, RAFT_AGENT_EXTENSION_NAME } from "./extension.ts";
 export { MessagingExtension, SendMessageTool, SEND_MESSAGE_TOOL } from "./messaging.ts";
 export { RoutingTransport, MainInboxDoc, type AgentMessageFrame, type MainInboxEntry, type MainInboxState } from "./router.ts";
 export { ReminderService, RemindersDoc, parseWhen, type Reminder, type RemindersState } from "./reminders.ts";
-export { MachineLock, MachineLockError } from "./machineLock.ts";
+export { MachineLock, MachineLockError, DEAD_STATES, procInfo, processAlive, processStartTime } from "./machineLock.ts";
 export { startServer, type ServeOptions } from "./serve.ts";
 export { appendToOutboxDoc } from "./outbox.ts";

@@ -4,3 +4,7 @@ dist/
 *.sqlite
 *.sqlite-journal
 .DS_Store
+deploy/build/
+deploy/*.egg-info/
+deploy/repo.tar.gz
+__pycache__/

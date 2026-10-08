@@ -34,7 +34,7 @@
 | # | 功能 | daemon | 本版状态 | 备注 |
 |---|---|---|---|---|
 | 13 | 结果外发不丢 | runtimeOutcomeOutbox：write-ahead/单在途/精确 ack/重传/cap/丢策略/unreliable/人工 resolve | **已有** | 十项不变量 e2e 全验 |
-| 14 | 结果恰好一次 | (agentId, clientSeq) 幂等 | **已有** | producedSubmissionIds dedupe 环 |
+| 14 | 结果恰好一次 | (agentId, clientSeq) 幂等 | **已有** | 每 submission 的持久 outcome receipt；与 frame/投影同事务 |
 | 15 | 多机接管 | takeover epoch / gap·cross marker / server 协商 | **不适用** | 一个 storage 一个 Harness，机制无意义 |
 | 16 | 崩溃分类与指纹 | runtimeErrorDiagnostics：scrub+fingerprint+errorAction | **已有** | outcome.ts/diagnostics.ts |
 | 17 | E1/E2 证据帧 | terminal_failure / turn_completed | **已有** | 同上 |
@@ -43,8 +43,8 @@
 | 20 | transcript 落盘 | sessionTranscriptReader | **已有** | transcripts/*.jsonl |
 | 21 | 启动失败熔断 | spawn-fail backoff / decision error window | **缺失** | 可对 err 计数入 cooldown |
 | 22 | 投递可见性账本 | agentVisibleDeliveryLedger：agent 到底"看见"了哪条消息 | **部分** | durable entry 天然可见性更强；显式账本缺失 |
-| 23 | machineLock 防双开 | 锁文件+token 防两个 daemon 抢一台机 | **已有** | `raftd.lock`（pid+token+内核启动时间原子锁）；serve 不可达时 CLI 拒开第二 Harness |
-| 24 | 孤儿进程回收 | daemonOrphanReaper SIGKILL 漏网子进程 | **不适用** | 没有子进程 |
+| 23 | machineLock 防双开 | 防两个 daemon 抢同一 state | **已有** | `raftd.lock.sqlite` 持续写事务；CLI 在开 Harness 前拿锁；崩溃自动释放 |
+| 24 | 孤儿进程回收 | daemonOrphanReaper SIGKILL 漏网子进程 | **已有** | `tool-children.jsonl` 台账（pid+内核启动时间）；serve 拿锁后按进程组收割 |
 
 ## 三、运维面（跑在客户机器上要管什么）
 

@@ -49,8 +49,13 @@ export function parseWhen(spec: string, now = new Date()): { dueAt: string; ever
   }
   const at = spec.match(/^at\s+(\d{1,2}):(\d{2})$/i);
   if (at) {
+    const hh = Number(at[1]);
+    const mm = Number(at[2]);
+    // setHours normalizes overflow (25:99 → next day 02:39) — reject it.
+    if (hh > 23) throw new Error(`invalid hour ${hh} in "${spec}" (0–23)`);
+    if (mm > 59) throw new Error(`invalid minute ${mm} in "${spec}" (0–59)`);
     const d = new Date(now);
-    d.setHours(Number(at[1]), Number(at[2]), 0, 0);
+    d.setHours(hh, mm, 0, 0);
     if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
     return { dueAt: d.toISOString(), everyMs: null };
   }
@@ -135,8 +140,11 @@ export class ReminderService {
         return false;
       });
     if (!delivered) {
-      // Keep the row so the next serve start retries the fire instead of
-      // silently losing the reminder.
+      // Keep the row AND re-arm for a retry — a stopped agent that later
+      // starts must still get the reminder (startAgent/resolveAgent also
+      // trigger resync via the daemon's reminder hook).
+      const retryAt = new Date(Date.now() + 60_000).toISOString();
+      this.arm({ ...t, dueAt: retryAt });
       return;
     }
     try {

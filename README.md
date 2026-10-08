@@ -9,7 +9,8 @@ Raft daemon 靠监管外部 CLI 进程做长驻会话；raftd 用
 
 ## 一分钟上手
 
-需要 **Node ≥ 22.7**（建议 24）+ **pnpm ≥ 10**（`corepack enable` 一次即可）。
+需要 **Node ≥ 24** + **pnpm ≥ 10**（`corepack enable` 一次即可）。
+（pi-durable 的 SQLite 存储用 `node:sqlite`，只有 Node 24+ 自带；Node 22.19+ 加 `--experimental-sqlite` 也能跑，但我们按 24 测试。）
 
 ```bash
 pnpm install
@@ -45,13 +46,18 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 - **进程死了接着跑**：SIGKILL 中途，重开 stateDir 后续跑完成，结果恰好一次送达
 - **恰好一次**：outbox 先写后发、单在途、精确 ack、重传退避；路由帧带 `route:<agent>:<seq>` 幂等键
 - **溢出 fail-closed**：outbox 满 128 先丢最老 `turn_completed`，没得丢就标记 unreliable，人工 `resolve` 才恢复
-- **双开拒绝**：`raftd.lock`（pid+token）防止第二个 serve 抢 storage；CLI 自动降级成 HTTP 薄客户端
-- **工作区沙箱**：每个 agent 的工作目录被约束在 `workspaces/` 下一级
+- **双开拒绝**：`raftd.lock.sqlite` 的持久连接写事务保证单实例；进程退出由操作系统释放，暂停仍持锁。CLI 在打开 storage 前拿锁，已有 serve 时走 HTTP 薄客户端
+- **工作区约定**（诚实说明：不是硬沙箱）：每个 agent 的工具默认在自己的 `workspaces/<agent>/` 目录里跑，创建 agent 时校验名字/路径不可逃逸；但 shell 工具按 cwd 执行，`cd ..` 之类的显式越界没有内核级隔离——别把它当安全边界，真正的边界是模型行为
 - **可打断**：`steer` 往运行中的轮次里插话；`whenBusy` = `steer`（插话）/ `followUp`（跑完此轮接着跑）/ `reject`（忙则拒绝）；不给=排队
 - **冷唤醒回收**：agent 静默超过阈值，下条消息先自动压缩上下文再跑——长驻不费 token
   （serve 默认 30m，`RAFTD_COMPACT_IDLE_MS=0` 关闭，e2e phase K 实测）
-- **联网安全**：`--host 0.0.0.0` 时必须设 `RAFTD_KEY`——之后所有 /api/* 要 Bearer 认证；
-  不设就打警告（控制台在 URL 上加 `?key=` 或在页面提示框里输）
+- **联网安全**：`--host` 绑公网地址时**必须**设 `RAFTD_KEY`——不设就拒绝启动
+  （`RAFTD_INSECURE=1` 显式放弃鉴权才会放它裸奔）。薄 CLI 读同一个 `RAFTD_KEY` 发 Bearer；
+  控制台在 URL 上加 `?key=` 或在页面提示框里输。名字 `main` 保留给操作员收件箱，不可创建。
+- **SIGKILL 时的工具子进程**（诚实说明）：daemon 被 `kill -9` 时，工具正在跑的子进程会成孤儿。
+  spawn 时会把子进程的 pid+内核启动时间记进 `tool-children.jsonl` 台账，下一次 `serve` 拿到实例锁后
+  收割台账里的进程组（含 leader 已死的后台进程组）——不误伤你在 workspace 里跑的其它程序，
+  进程「cd 走」也逃不掉。台账有天生盲区：spawn 与记账之间的极端窄窗（微秒级）仍会漏网，视为尽力而为而不是硬保证
 
 ## 布局
 
@@ -69,28 +75,45 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 ## 验证
 
 ```bash
+python3 -m pip install ./deploy      # Python ≥ 3.11；wrapper 的 FastAPI / Uvicorn / HTTPX
+pnpm typecheck && pnpm test:reliability  # 不需要模型 key：锁、历史迁移、真实 wrapper/CLI
 pnpm typecheck && pnpm e2e    # 需要模型 key；报告写到 e2e/report.md
 ```
 
+`test:reliability` 覆盖跨进程锁竞争、暂停/崩溃、发布失败、4095/4096/4097 条历史、
+迁移中断恢复、公开发现、端口冲突和并发 child 恢复。完整故障套件在 Linux 上运行；
+Node 锁测试中依赖 Linux `/proc` 的场景在其他平台明确跳过。
+GitHub Actions 在每个 PR 和 main 推送时运行 typecheck 与这套无模型 key 回归。
+Docker 自验使用真实 `/data/raftd`，先从 HTTP 创建 agent，再要求 CLI 读到同一个 agent 并拒绝错误 key。
+
 当前 e2e 覆盖：真实 GLM 问答 / bash 写文件 / SIGKILL 原地复活 / steer 插队 /
 outbox 十项不变量 / agent 互发消息 / 收件箱 / 弹回 / 提醒触发 / 锁与双开 /
-serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 第三轮加固回归（活提醒触发、stopped 目标永久弹回、
-坏 transcript 行容忍、锁竞争、stale port 拒开、API 400/404/409）。
+serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 加固回归（活提醒、stopped 弹回、坏行容忍、锁竞争、
+stale port 拒开、API 400/404/409）/ issue-#2 三轮边界回归（SIGSTOP 锁持有者、zombie 锁主、
+后台进程组收割、丢投影重建、wrapper 16 并发共享启动、薄 CLI 经公网口、Docker 真构建+源码一致性）。
 
 ## 常见问题
 
 - **端口被占**：`pnpm cli serve --port 4999` 换个端口。
-- **"state dir already locked"**：上一任 serve 还活着（看 pid），或者它非正常死亡留下了
-  `raftd.lock`——确认进程真死了就删掉 state 目录里的 `raftd.lock` 再启动。
+- **"state dir already locked"**：同一 state 已有持锁进程，暂停进程也仍持锁；异常退出会自动释放。
+  `raftd.lock` 仅记录 pid/token 供诊断，不能靠删文件解锁。`raftd.lock.sqlite` 和
+  宿主发现锁 `raftd.wrapper.sqlite` 必须保留，
+  运行时不可删除、替换或通过普通文件读写操作打开它。锁依赖本地文件系统的 SQLite 锁语义；
+  升级前先停止旧 daemon，不同时运行使用旧目录锁协议的二进制。
 - **agent 不回答 / `unanswered: no_model`**：一个 provider key 都没读到。
   认这些变量名：`ZAI_CODING_CN_API_KEY` / `zhipu` / `ZAI_API_KEY` /
   `MINIMAX_CN_API_KEY` / `MINIMAX_CN` / `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` /
   `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`——export 任一后重启 serve
   （启动时 0 个 provider 会直接打 warning）。
 - **状态在哪**：`--state` 指定目录（默认 `./.raftd`），备份=拷目录；删除=连目录一起 `rm -rf`。布局：
-  `session.sqlite`（会话+outbox+提醒 全 durable）、`workspaces/<agent>/`（沙箱工作区）、
+  `session.sqlite`（会话+outbox+提醒 全 durable）、`workspaces/<agent>/`（约定工作区）、
   `transcripts/<agent>.events.jsonl`（事件流水）、`.deliveries/`（送达账本，`pnpm cli deliveries`）、
-  `raftd.lock`/`raftd.port`（单实例锁 / 薄客户端发现文件）。
+  `raftd.lock.sqlite`（系统锁）、`raftd.wrapper.sqlite`（宿主发现锁）、
+  `raftd.lock`（诊断元数据）、`raftd.port`（薄客户端发现）。
+- **长历史升级**：每条 outcome 的产帧/投影标记与 frame 和计数原子提交，超过 4096 条不会忘记。
+  老版本迁移会参考旧去重表、待发队列和默认 `.deliveries` 账本；使用自定义 transport 且老记录已被
+  环形表遗忘、又没有交付账本时，无法确认是否发过，只能按至少一次语义保守补发一次。
+  慢/失败 consumer 下仍保留 128 条 outbox 的 fail-closed 规则。
 - **`<agent>` 参数**：名字和 agent-id 都行。
 - **其余命令**：`show / deliveries / stop / start / abort / resolve / reset / compact / reminders`
   全在 `pnpm cli help` 里。
@@ -100,9 +123,20 @@ serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 第三轮加固回归（活提�
 
 ## 上云
 
-`deploy/` 是给 Fly.io 准备的完整包裹：`app/main.py` 是个 FastAPI 反代（起 `raftd serve`、
-`RAFTD_KEY` 鉴权、`POST /setup/env` 持久化模型 key），`Dockerfile` 一个镜像装 Node24+pnpm+全仓库。
-`fly deploy` 或直接 Devin「部署后端」。状态全在 `/data` 卷里，机器回收不丢。
+`deploy/` 是给 Fly.io 准备的完整包裹：`app/main.py` 是个 FastAPI 反代——对外只有 `/healthz` 和
+控制台首页公开，其余一律要 admin key（`Authorization: Bearer` 或 `?key=`）；key 取 `RAFTD_KEY`，
+没设就自动生成并存进 `/data` 卷的 `admin-key` 文件（日志里也会打）。child daemon 用独立的内部 key，
+你的 key 只在外层校验、不进子进程。`POST /setup/env`（同样要 key）持久化 provider key 到
+`/data/.env`；旧版 `/data/raftd/child.env` 的存量配置会自动并进来，升级不丢。
+
+`Dockerfile` 从**仓库根**用当前源码构建（不再打包仓库里的 tar 快照）：
+
+```bash
+docker build -f deploy/Dockerfile -t raftd .    # 在仓库根目录跑
+fly deploy                                     # fly.toml 也在仓库根
+```
+
+状态全在 `/data` 卷里（session.sqlite / workspaces / admin-key / .env），机器回收不丢。
 
 ## 明确不做的
 

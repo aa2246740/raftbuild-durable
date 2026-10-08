@@ -23,7 +23,7 @@
  * instance to attribute gaps to — a drop is simply fail-closed → unreliable.
  */
 import { defineDocFamily } from "@earendil-works/pi-durable";
-import type { Harness } from "@earendil-works/pi-durable";
+import type { Harness, Tx } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { OutboxDocEntry, OutboxDocState, OutboxFrame } from "./types.ts";
 import type { OutboxTransport } from "./transport.ts";
@@ -55,6 +55,19 @@ export const OutboxDoc = defineDocFamily<OutboxDocState, string>({
   }),
 });
 
+/** Permanent per-key receipt. Unlike the legacy 4096-key ring, one receipt
+ * never evicts another; each document stays constant-sized. */
+export const OutcomeReceiptDoc = defineDocFamily<{ produced: boolean; projected: boolean }, string>({
+  kind: "raft.outcomeReceipt",
+  version: 1,
+  scope: "session",
+  family: true,
+  initial: () => ({ produced: false, projected: false }),
+});
+
+export const outcomeReceiptKey = (agentId: string, submissionId: string): string =>
+  JSON.stringify([agentId, submissionId]);
+
 export class OutboxError extends Error {
   constructor(
     message: string,
@@ -80,9 +93,8 @@ export function appendToOutboxDoc(
   if (dedupeKey !== undefined) {
     if (doc.producedSubmissionIds.includes(dedupeKey)) return { duplicate: true };
     doc.producedSubmissionIds.push(dedupeKey);
-    // Durable dedupe memory. Capped so the doc stays bounded; eviction means
-    // a >4096-settle-old submission could re-produce one frame — accepted,
-    // documented in NOTES.md (dedupe survives restart, only the far tail ages out).
+    // Legacy/tool-call compatibility ring. Outcome appends through AgentOutbox
+    // use permanent OutcomeReceiptDoc members instead of this bounded set.
     if (doc.producedSubmissionIds.length > 4096) {
       doc.producedSubmissionIds.splice(0, doc.producedSubmissionIds.length - 4096);
     }
@@ -164,6 +176,7 @@ export class AgentOutbox {
   async append(
     frame: OutboxFrame,
     dedupeKey?: string,
+    inTx?: (tx: Tx) => Promise<void>,
   ): Promise<{ clientSeq: number; result: OutboxAppendResult } | { duplicate: true }> {
     if (this.memoryUnreliable) {
       throw new OutboxError(`agent ${this.agentId} outbox is unreliable: ${this.memoryUnreliable}`, "unreliable");
@@ -174,7 +187,20 @@ export class AgentOutbox {
         if (doc.unreliable) {
           throw new OutboxError(`agent ${this.agentId} outbox is unreliable since ${doc.unreliable.since}`, "unreliable");
         }
-        return appendToOutboxDoc(doc, frame, dedupeKey);
+        // Outcome receipts outlive the bounded legacy/tool-call ring. Check
+        // them inside the SAME transaction as the frame and projection.
+        const receipt = dedupeKey !== undefined && frame.type === "agent:runtime:outcome"
+          ? await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(this.agentId, dedupeKey), dedupeKey)
+          : undefined;
+        const duplicate = receipt?.produced || (receipt && doc.producedSubmissionIds.includes(dedupeKey!));
+        const result = duplicate
+          ? { duplicate: true as const }
+          : appendToOutboxDoc(doc, frame, receipt ? undefined : dedupeKey);
+        if (receipt) receipt.produced = true;
+        // Legacy frame-only commits can still need projection. The callback
+        // owns its own persistent receipt, so it is safe on duplicates too.
+        if (receipt || !("duplicate" in result)) await inTx?.(tx);
+        return result;
       }, this.ctx);
     } catch (err) {
       const benignClose = err instanceof Error && /session is closed/i.test(err.message);
@@ -192,6 +218,10 @@ export class AgentOutbox {
 
   /** Durable marker; retries its own commit until it lands (or the doc is unreadable). */
   async markUnreliable(cause: string): Promise<void> {
+    // Memory fail-closed FIRST: the same failure that broke the write usually
+    // breaks the marker commit too (sustained ENOSPC etc.). Only an explicit
+    // resolve() clears the agent — never a lucky next commit.
+    this.memoryUnreliable = cause;
     try {
       await this.harness.commit(async (tx) => {
         const doc = await tx.doc(OutboxDoc, this.agentId, this.agentId);
@@ -200,8 +230,7 @@ export class AgentOutbox {
         }
       }, this.ctx);
     } catch {
-      // Even the marker cannot be written; the agent stays unreliable in
-      // memory for this process — append() will keep failing to commit.
+      this.memoryUnreliable = `${cause} (unreliable-marker write also failed)`;
     }
     // Tell the consumer, best-effort, bypassing the outbox itself.
     try {

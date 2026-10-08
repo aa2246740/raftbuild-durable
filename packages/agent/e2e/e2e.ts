@@ -20,7 +20,7 @@
  * Run: pnpm e2e          (needs a real model key: zhipu or ZAI_CODING_CN_API_KEY)
  * Report: e2e/report.md
  */
-import { spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -31,6 +31,12 @@ import {
   DurableDaemon,
   MachineLock,
   MachineLockError,
+  processStartTime,
+  procInfo,
+  DEAD_STATES,
+  trackToolChildren,
+  AgentsDoc,
+  JsonlDeliveryTransport,
   OutboxDoc,
   OutboxError,
   ReminderService,
@@ -48,11 +54,33 @@ import {
 
 const MODEL = { provider: "zai-coding-cn", modelId: "glm-5.3-flash" };
 const PKG_DIR = path.resolve(import.meta.dirname, "..");
+const REPO_ROOT = path.resolve(PKG_DIR, "..", "..");
+const GIT_SHA = (() => {
+  try {
+    const sha = execSync("git rev-parse HEAD", { cwd: REPO_ROOT }).toString().trim();
+    const dirty = execSync("git status --porcelain", { cwd: REPO_ROOT }).toString().trim() ? "-dirty" : "";
+    return sha + dirty;
+  } catch {
+    return "unknown";
+  }
+})();
 const STATE_DIR = await mkdtemp(path.join(tmpdir(), "raftd-e2e-"));
 const REPORT = path.join(PKG_DIR, "e2e", "report.md");
 
 type Check = { phase: string; name: string; ok: boolean; detail: string };
 const checks: Check[] = [];
+const skipped: { phase: string; name: string; reason: string }[] = [];
+
+// No model key → the run used to die 13 checks in and leave the PREVIOUS
+// green report.md standing. Stamp the report immediately, then bail.
+if (!(process.env.zhipu ?? process.env.ZAI_CODING_CN_API_KEY)) {
+  await mkdir(path.dirname(REPORT), { recursive: true });
+  await writeFile(REPORT, "# E2E report — raftbuild-durable\n\n**ABORTED**: no model API key (set zhipu or ZAI_CODING_CN_API_KEY).\n");
+  console.error("e2e needs a real model key (zhipu / ZAI_CODING_CN_API_KEY) — refusing to leave a stale report");
+  process.exit(1);
+}
+// The report is always this run's, not a stale leftover.
+await writeFile(REPORT, "# E2E report — raftbuild-durable\n\n(running…)\n");
 let currentPhase = "";
 function phase(name: string) {
   currentPhase = name;
@@ -63,7 +91,31 @@ function check(name: string, ok: boolean, detail = ""): boolean {
   console.log(`${ok ? "  ✓" : "  ✗"} ${name}${detail ? ` — ${detail}` : ""}`);
   return ok;
 }
+function skip(name: string, reason: string): void {
+  skipped.push({ phase: currentPhase, name, reason });
+  console.log(`  ⊘ ${name} — SKIPPED: ${reason}`);
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Reserve a genuinely free port — a hardcoded port collides with orphans
+ * left by a previous crashed e2e run (verified: EADDRINUSE → silent dead srv). */
+async function freePort(): Promise<number> {
+  const { createServer } = await import("node:net");
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.listen(0, "127.0.0.1", () => {
+      const p = (s.address() as { port: number }).port;
+      s.close(() => resolve(p));
+    });
+    s.once("error", reject);
+  });
+}
+
+/** Wait for a child to exit without hanging when it already did. */
+async function waitExit(p: ReturnType<typeof spawn>, graceMs = 8_000): Promise<void> {
+  if (p.exitCode !== null || p.signalCode !== null) return;
+  await Promise.race([new Promise((r) => p.once("exit", r)), sleep(graceMs)]);
+}
 
 async function waitFor(desc: string, fn: () => Promise<boolean> | boolean, timeoutMs = 120_000, interval = 1_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -89,6 +141,16 @@ async function readDeliveries(stateDir: string, agentId: string): Promise<Outbox
 
 function transcriptFile(stateDir: string, agentId: string): string {
   return path.join(stateDir, "transcripts", `${agentId}.events.jsonl`);
+}
+
+async function transcriptCount(stateDir: string, agentId: string, needle: string): Promise<number> {
+  try {
+    return (await readFile(transcriptFile(stateDir, agentId), "utf8"))
+      .split("\n")
+      .filter((l) => l.includes(needle)).length;
+  } catch {
+    return 0;
+  }
 }
 
 async function transcriptHas(stateDir: string, agentId: string, needle: string): Promise<boolean> {
@@ -217,8 +279,10 @@ async function phaseC(stateDir: string, agentId: string) {
     return;
   }
 
-  // Wait until the turn is actually running (tool call visible), then kill -9.
-  const sawTool = await waitFor("tool call in transcript", () => transcriptHas(stateDir, agentId, '"kind":"tool_call"'), 60_000, 500);
+  // Wait until THIS turn's tool call is visible (count-relative — phase B
+  // already produced tool_call lines in the same transcript), then kill -9.
+  const toolCallsBefore = await transcriptCount(stateDir, agentId, '"kind":"tool_call"');
+  const sawTool = await waitFor("tool call in transcript", async () => (await transcriptCount(stateDir, agentId, '"kind":"tool_call"')) > toolCallsBefore, 60_000, 500);
   if (sawTool) await sleep(1_500);
   worker.kill("SIGKILL");
   const dead = await new Promise<boolean>((res) => worker.once("exit", () => res(true)));
@@ -231,7 +295,7 @@ async function phaseC(stateDir: string, agentId: string) {
   recover.stderr.on("data", (d) => (recOut += String(d)));
   const settled = await waitFor(
     "recovered daemon settles the submission",
-    () => /SETTLED \d+ status=/.test(recOut),
+    () => new RegExp(`SETTLED ${submissionId} status=done`).test(recOut),
     300_000,
     2_000,
   );
@@ -536,10 +600,10 @@ async function phaseI(stateDir: string, agentId: string) {
 
 // ── J: machine lock + serve HTTP + thin-CLI ─────────────────────────────────
 
-function runCli(stateDir: string, args: string[]): Promise<{ code: number | null; out: string }> {
+function runCli(stateDir: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
     const p = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), ...args], {
-      env: { ...process.env, RAFTD_STATE: stateDir },
+      env: { ...process.env, RAFTD_STATE: stateDir, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -688,6 +752,682 @@ async function phaseK(stateDir: string) {
 
 // ── L: hardening regressions (critic-driven fixes) ──────────────────────────
 
+// ── M: issue-#2 regression battery (local, no model calls) ────────────────
+
+async function phaseM(stateDir: string) {
+  phase("M — issue-#2 regressions");
+
+  // Lock: 32 concurrent acquires → exactly one winner, all others refused.
+  const race = await Promise.allSettled([...Array(32)].map(() => MachineLock.acquire(stateDir)));
+  const winners = race.filter((r) => r.status === "fulfilled");
+  const losers = race.filter((r) => r.status === "rejected" && r.reason instanceof MachineLockError);
+  check("32-way lock race: exactly one holder", winners.length === 1, `won=${winners.length} refused=${losers.length}`);
+  await (winners[0] as PromiseFulfilledResult<MachineLock> | undefined)?.value.release();
+
+  // Delivery-ledger dedupe: replayed (agentId, clientSeq) never written twice,
+  // even across transport instances (delivery-vs-ack crash window).
+  const dedupDir = path.join(stateDir, ".deliveries-dedupe");
+  await mkdir(dedupDir, { recursive: true });
+  const env = (seq: number): OutboxEnvelope => ({
+    agentId: "ledger-x",
+    clientSeq: seq,
+    attempt: 1,
+    frame: { type: "agent:runtime:outcome", agentId: "ledger-x", submissionId: "9" } as OutboxFrame,
+  });
+  const t1 = new JsonlDeliveryTransport(dedupDir);
+  await t1.send(env(2));
+  await t1.send(env(2));
+  const t2 = new JsonlDeliveryTransport(dedupDir);
+  await t2.send(env(2));
+  await t2.send(env(3));
+  const ledgerRaw = await readFile(path.join(dedupDir, "ledger-x.jsonl"), "utf8");
+  const seqs = ledgerRaw.trim().split("\n").map((l) => JSON.parse(l).clientSeq);
+  check("ledger dedupes replayed clientSeq", seqs.join(",") === "2,3", `seqs=${seqs.join(",")}`);
+
+  // parseWhen rejects out-of-range `at` (was silently rolling to another day).
+  let threw2599 = false;
+  try { parseWhen("at 25:99"); } catch { threw2599 = true; }
+  check("`at 25:99` rejected", threw2599);
+  check("`at 23:59` parses", parseWhen("at 23:59").dueAt.length > 0);
+
+  const daemon = await DurableDaemon.open({ stateDir, providers: "env", defaultModel: MODEL });
+  try {
+    // "main" is the operator inbox — reserved, not a creatable agent name.
+    let mainRefused = false;
+    try { await daemon.createAgent({ name: "main", model: MODEL }); } catch (err) { mainRefused = err instanceof AgentRegistryError; }
+    check('agent named "main" refused', mainRefused);
+
+    // Submission ownership: a foreign/unknown submission answers 404.
+    const { record } = await daemon.createAgent({ name: "mike", model: MODEL });
+    const owner = await daemon.submissionOwner("999999");
+    check("unknown submission has no owner", owner === undefined, String(owner));
+    void record;
+  } finally {
+    await daemon.close();
+  }
+
+  // HTTP validation + thin-CLI parity against a real serve.
+  const portA = await freePort();
+  const srv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portA)], {
+    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let srvOut = "";
+  srv.stdout.on("data", (d) => (srvOut += String(d)));
+  srv.stderr.on("data", (d) => (srvOut += String(d)));
+  const up = await waitFor("serve up", async () => (await fetch(`http://127.0.0.1:${portA}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  check("test serve up", up, srvOut.trim().slice(-120));
+  if (up) {
+    const post = (p: string, body: unknown) =>
+      fetch(`http://127.0.0.1:${portA}/api/${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    check("POST agents body=null → 400", (await post("agents", null)).status === 400);
+    check("POST agents name=123 → 400", (await post("agents", { name: 123 })).status === 400);
+    check('POST agents name="   " → 400', (await post("agents", { name: "   " })).status === 400);
+    check('POST agents name="main" → 400', (await post("agents", { name: "main" })).status === 400);
+    const nu = await post("agents", { name: "nova" });
+    check("POST agents valid → 201", nu.status === 201, `status=${nu.status}`);
+    const nova = (await nu.json()) as { agentId: string };
+    check("POST messages text=object → 400", (await post(`agents/${nova.agentId}/messages`, { text: { x: 1 } })).status === 400);
+    check("POST reminders when=at 25:99 → 400", (await post("reminders", { agent: "nova", when: "at 25:99", text: "x" })).status === 400);
+    check("GET answer foreign submission → 404", (await fetch(`http://127.0.0.1:${portA}/api/agents/${nova.agentId}/answer?submissionId=424242`)).status === 404);
+
+    // Thin-CLI parity (serve holds the state, CLI is remote).
+    const delAll = await runCli(stateDir, ["deliveries"], { RAFTD_KEY: "" });
+    check("remote deliveries w/o agent works", delAll.code === 0 && !delAll.out.includes("undefined"), delAll.out.trim().slice(0, 80));
+    const badSend = await runCli(stateDir, ["send", "ghost", "hi"], { RAFTD_KEY: "" });
+    check(
+      "remote HTTP error not disguised as unreachable",
+      badSend.code !== 0 && badSend.out.includes("remote") && !badSend.out.includes("Refusing"),
+      badSend.out.trim().slice(0, 120),
+    );
+    const mk = await runCli(stateDir, ["create", "remws", "--workspace", "wk-remote", "--thinking", "low"], { RAFTD_KEY: "" });
+    const sh = mk.code === 0 ? await runCli(stateDir, ["show", "remws"], { RAFTD_KEY: "" }) : { code: 1, out: mk.out };
+    check(
+      "remote create forwards --workspace/--thinking",
+      sh.code === 0 && sh.out.includes("wk-remote") && sh.out.includes('"thinkingLevel": "low"'),
+      sh.out.trim().replace(/\s+/g, " ").slice(0, 140),
+    );
+
+    srv.kill("SIGKILL");
+    await waitExit(srv);
+
+    // Bearer: keyed serve + thin CLI must authenticate.
+    const portB = await freePort();
+    const srv2 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portB)], {
+      env: { ...process.env, RAFTD_KEY: "k3y" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const up2 = await waitFor("keyed serve up", async () => (await fetch(`http://127.0.0.1:${portB}/api/state`, { headers: { authorization: "Bearer k3y" } }).catch(() => null))?.ok ?? false, 60_000, 500);
+    check("keyed serve up", up2);
+    if (up2) {
+      const noKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "" });
+      check("thin CLI without RAFTD_KEY → 401 surfaced", noKey.code !== 0 && /401|unauthorized|remote/i.test(noKey.out), noKey.out.trim().slice(0, 100));
+      const withKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "k3y" });
+      check("thin CLI with RAFTD_KEY works", withKey.code === 0, withKey.out.trim().slice(0, 100));
+    }
+    srv2.kill("SIGKILL");
+    await waitExit(srv2);
+    await rm(path.join(stateDir, "raftd.port"), { force: true });
+  } else {
+    srv.kill("SIGKILL");
+  }
+
+  // Non-loopback without RAFTD_KEY refuses to start.
+  const refusedSrv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--host", "0.0.0.0", "--port", String(await freePort())], {
+    env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let refOut = "";
+  refusedSrv.stdout.on("data", (d) => (refOut += String(d)));
+  refusedSrv.stderr.on("data", (d) => (refOut += String(d)));
+  const refCode = await Promise.race([
+    new Promise<number | null>((r) => refusedSrv.once("exit", (c) => r(c))),
+    sleep(20_000).then(() => -1),
+  ]);
+  if (refCode === -1) refusedSrv.kill("SIGKILL");
+  check("--host 0.0.0.0 without RAFTD_KEY refused", refCode !== 0 && refCode !== -1 && /refus/i.test(refOut), `code=${refCode} ${refOut.trim().slice(0, 100)}`);
+}
+
+async function phaseN(stateDir: string) {
+  phase("N — issue-#2 round-2 regressions");
+
+  // Stale-lock takeover stress: a dead-owner lock preset each round, 32
+  // concurrent acquires — exactly one winner or the mutex protocol leaked.
+  let multi = 0;
+  let maxWinners = 0;
+  let badRounds = 0;
+  for (let round = 0; round < 40; round++) {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-stale-"));
+    await writeFile(path.join(dir, "raftd.lock"), JSON.stringify({
+      pid: 2147483647, token: "dead-owner", startedAt: "2000-01-01T00:00:00Z",
+    }));
+    const results = await Promise.allSettled([...Array(32)].map(() => MachineLock.acquire(dir)));
+    const won = results.filter((r) => r.status === "fulfilled");
+    maxWinners = Math.max(maxWinners, won.length);
+    if (won.length !== 1) badRounds++; // EVERY round must yield exactly one
+    if (won.length > 1) multi++;
+    for (const w of won) await (w as PromiseFulfilledResult<MachineLock>).value.release();
+    await rm(dir, { recursive: true, force: true });
+  }
+  check("stale-lock takeover: exactly one winner every round", badRounds === 0, `badRounds=${badRounds} max=${maxWinners}`);
+
+  // Orphan reaping is ledger-based, not cwd-based: a recorded child is
+  // killed even after cd'ing elsewhere; an unrecorded process sitting in
+  // the workspace is left alone.
+  const ws = path.join(stateDir, "workspaces", "e2e-stray");
+  const elsewhere = await mkdtemp(path.join(tmpdir(), "raftd-e2e-elsewhere-"));
+  await mkdir(ws, { recursive: true });
+  const stray = spawn("sleep", ["120"], { cwd: ws, detached: true, stdio: "ignore" });
+  const orphanInWs = spawn("sleep", ["120"], { cwd: ws, detached: true, stdio: "ignore" });
+  const orphanElsewhere = spawn("sleep", ["120"], { cwd: elsewhere, detached: true, stdio: "ignore" });
+  for (const p of [stray, orphanInWs, orphanElsewhere]) p.unref();
+  await sleep(400);
+  const ledgerFile = path.join(stateDir, "tool-children.jsonl");
+  await writeFile(ledgerFile,
+    [orphanInWs, orphanElsewhere]
+      .map((p) => JSON.stringify({ pid: p.pid, start: processStartTime(p.pid!) }))
+      .join("\n") + "\n");
+  const alive = (pid: number | undefined) => {
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const dOrphan = await DurableDaemon.open({ stateDir, providers: [] });
+  await dOrphan.reapOrphanedToolChildren();
+  await sleep(300);
+  check("ledger-recorded orphan in workspace reaped", !alive(orphanInWs.pid));
+  check("ledger-recorded orphan outside workspace reaped", !alive(orphanElsewhere.pid));
+  check("unrecorded process in workspace spared", alive(stray.pid));
+  await dOrphan.close();
+  stray.kill("SIGKILL");
+  await rm(elsewhere, { recursive: true, force: true });
+
+  // Legacy upgrade: a record without projectedSubmissions must NOT recount
+  // outcomes the old code already projected (double-count regression).
+  const dLeg = await DurableDaemon.open({ stateDir, providers: [] });
+  const { record: leg } = await dLeg.createAgent({ name: "legacybot", model: MODEL });
+  await dLeg.postMessage(leg.agentId, "hello");
+  const settled = await waitFor("legacy submission settles", async () => {
+    const r = (await dLeg.listAgents()).find((a) => a.agentId === leg.agentId);
+    return (r?.runs ?? 0) + (r?.failures ?? 0) >= 1;
+  }, 60_000, 500);
+  check("legacy submission settled once", settled);
+  // Strip the field — that's what pre-ledger records look like on disk.
+  await dLeg.harness.commit(async (tx) => {
+    const doc = await tx.doc(AgentsDoc);
+    const r = doc.records[leg.agentId];
+    if (r) delete (r as { projectedSubmissions?: string[] }).projectedSubmissions;
+  }, BACKGROUND_CONTEXT);
+  await dLeg.close();
+  const dLeg2 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLeg2.resume();
+  const legAfter = (await dLeg2.listAgents()).find((a) => a.agentId === leg.agentId);
+  check(
+    "legacy upgrade does not double-count outcomes",
+    (legAfter?.runs ?? 0) + (legAfter?.failures ?? 0) === 1,
+    `runs=${legAfter?.runs} failures=${legAfter?.failures}`,
+  );
+  await dLeg2.close();
+
+  // whenBusy=reject on a genuinely running conversation → 409, not 500.
+  const portN = await freePort();
+  const srvN = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portN)], {
+    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let srvNOut = "";
+  srvN.stdout.on("data", (d) => (srvNOut += String(d)));
+  srvN.stderr.on("data", (d) => (srvNOut += String(d)));
+  const upN = await waitFor("reject-test serve up", async () => (await fetch(`http://127.0.0.1:${portN}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  check("reject-test serve up", upN, srvNOut.trim().slice(-100));
+  if (upN) {
+    const mk = await fetch(`http://127.0.0.1:${portN}/api/agents`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "busybot" }),
+    });
+    const { agentId: busyId } = (await mk.json()) as { agentId: string };
+    await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Run exactly this bash command: sleep 60; echo done. Then reply DONE." }),
+    });
+    const rej = await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "jump the queue", whenBusy: "reject" }),
+    });
+    check("whenBusy=reject while running → 409", rej.status === 409, `status=${rej.status} ${await rej.text().catch(() => "")}`);
+    srvN.kill("SIGKILL");
+    await waitExit(srvN);
+    await rm(path.join(stateDir, "raftd.port"), { force: true });
+  } else {
+    srvN.kill("SIGKILL");
+  }
+}
+
+async function phaseO(stateDir: string): Promise<void> {
+  phase("O — issue-#2 round-3 regressions (scheduling boundaries)");
+  const linux = process.platform === "linux";
+  const E2E_DIR = path.join(PKG_DIR, "e2e");
+
+  // ── O1: a LIVE (SIGSTOP'd) lock owner keeps exclusive ownership ─────
+  // Exercise the public lock API in a separate OS process. Pausing a real
+  // owner must not permit takeover; killing it must release ownership.
+  if (!linux) {
+    skip("paused lock owner SIGSTOP", "linux-only (/proc state, signals)");
+  } else {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-mutex-"));
+    const holder = spawn(process.execPath, ["--experimental-transform-types", path.join(E2E_DIR, "lock-mutex-holder.mjs"), dir], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let holderOut = "";
+    holder.stdout.on("data", (d) => (holderOut += String(d)));
+    holder.stderr.on("data", (d) => (holderOut += String(d)));
+    try {
+      const claimed = await waitFor("lock holder acquired", () => holderOut.split("\n").includes("ACQUIRED"), 15_000, 100);
+      check("machine lock acquired by separate process", claimed, holderOut.trim().slice(-120));
+      if (claimed) {
+        process.kill(holder.pid!, "SIGSTOP");
+        const stopped = await waitFor("holder enters stopped state", () => procInfo(holder.pid!)?.state === "T", 5_000, 100);
+        check("holder actually stopped", stopped, `state=${procInfo(holder.pid!)?.state}`);
+        let refused = false;
+        let reason = "unexpectedly acquired";
+        try {
+          const unexpected = await MachineLock.acquire(dir);
+          await unexpected.release();
+        } catch (err) {
+          refused = err instanceof MachineLockError;
+          reason = err instanceof Error ? err.message : String(err);
+        }
+        check("paused live owner refuses a second acquire", refused, reason);
+        holder.kill("SIGKILL");
+        await waitExit(holder);
+        const won = await MachineLock.acquire(dir).catch(() => null);
+        check("lock can be acquired after the owner dies", won !== null);
+        await won?.release();
+      }
+    } finally {
+      holder.kill("SIGKILL");
+      await waitExit(holder);
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // ── O2: zombie lock owner is dead, not locked ─────────────────────────
+  // A parent that never wait()s leaves the killed lock holder in Z state;
+  // kill(pid,0) still succeeds on zombies, so /proc state must drive the
+  // liveness call. Fixture: e2e/zombie-owner.py.
+  const hasPy = spawnSync("python3", ["-V"], { stdio: "pipe" }).status === 0;
+  if (!linux || !hasPy) {
+    skip("zombie lock owner", linux ? "python3 unavailable" : "linux-only");
+  } else {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-zom-"));
+    const zp = spawn("python3", [path.join(E2E_DIR, "zombie-owner.py"), dir], { stdio: ["pipe", "pipe", "pipe"] });
+    let zomOut = "";
+    zp.stdout.on("data", (d) => (zomOut += String(d)));
+    zp.stderr.on("data", (d) => (zomOut += String(d)));
+    const ready = await waitFor("zombie owner ready", () => zomOut.includes("READY"), 60_000, 200);
+    const zPid = Number(/pid=(\d+)/.exec(zomOut)?.[1]);
+    check("zombie owner fixture up (Z state)", ready && procInfo(zPid)?.state === "Z", zomOut.trim().slice(0, 100));
+    if (ready) {
+      const lock = await MachineLock.acquire(dir).catch(() => null);
+      check("zombie-owned lock taken over", lock !== null);
+      await lock?.release();
+    }
+    zp.stdin.end();
+    await waitExit(zp);
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  // ── O3: real tool spawn → leader exits, background group reaped ──────
+  // The REAL exec path (NodeExecutionEnv + the daemon's own
+  // trackToolChildren hook) spawns `(sleep N; write file) &` — the ledger
+  // pid exits while the delayed write is still armed. daemon.open() must
+  // kill the whole group, and the file must never materialize.
+  if (!linux) {
+    skip("background-descendant group reaping", "linux-only (/proc groups)");
+  } else {
+    const odir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-orphan-"));
+    const { NodeExecutionEnv } = await import("@earendil-works/pi-durable/env/node");
+    const env = new NodeExecutionEnv({ cwd: odir });
+    trackToolChildren(env, odir); // the daemon's own ledger hook
+    const bgPidFile = path.join(odir, "bgpid.txt");
+    const sideEffect = path.join(odir, "background.txt");
+    // Subshell stdio → /dev/null so env.exec resolves on the leader's exit
+    // instead of waiting for the orphaned pipes to close.
+    await env.exec(`(sleep 5; printf orphan-finished > ${sideEffect}) >/dev/null 2>&1 & echo $! > ${bgPidFile}; exit 0`, {}, BACKGROUND_CONTEXT);
+    const wrotePid = await waitFor("background pid recorded", () => existsSync(bgPidFile), 10_000, 100);
+    const bgPid = wrotePid ? Number((await readFile(bgPidFile, "utf8")).trim()) : 0;
+    const bgAlive = () => {
+      const i = procInfo(bgPid);
+      return i !== undefined && !["Z", "X", "x"].includes(i.state);
+    };
+    check("background descendant outlived its ledger leader", wrotePid && bgAlive(), `bgpid=${bgPid}`);
+    const dO = await DurableDaemon.open({ stateDir: odir, providers: [] });
+    await dO.reapOrphanedToolChildren();
+    await sleep(400);
+    check("dead-leader group reaped", wrotePid && !bgAlive());
+    await dO.close();
+    await sleep(5_500);
+    check("delayed side-effect never landed", !existsSync(sideEffect));
+    await rm(odir, { recursive: true, force: true }).catch(() => {});
+
+    // Ledger edge cases: a stale-start line for a live pid must not consume
+    // it (a later valid line still reaps); a {pid}-only line has no identity
+    // and must never kill.
+    const stray = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    stray.unref();
+    await sleep(300);
+    const strayDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-led-"));
+    await writeFile(path.join(strayDir, "tool-children.jsonl"),
+      JSON.stringify({ pid: stray.pid, start: "0" }) + "\n" +
+      JSON.stringify({ pid: stray.pid, start: processStartTime(stray.pid!) }) + "\n");
+    const dS = await DurableDaemon.open({ stateDir: strayDir, providers: [] });
+    await dS.reapOrphanedToolChildren();
+    await sleep(400);
+    check("pid-reuse history: later valid entry still reaps", procInfo(stray.pid!) === undefined || DEAD_STATES.has(procInfo(stray.pid!)!.state));
+    await dS.close();
+    stray.kill("SIGKILL");
+    await rm(strayDir, { recursive: true, force: true }).catch(() => {});
+
+    const ghost = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    ghost.unref();
+    await sleep(300);
+    const ghostDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-ghost-"));
+    await writeFile(path.join(ghostDir, "tool-children.jsonl"), JSON.stringify({ pid: ghost.pid }) + "\n");
+    const dG = await DurableDaemon.open({ stateDir: ghostDir, providers: [] });
+    await dG.reapOrphanedToolChildren();
+    await sleep(400);
+    const gInfo = procInfo(ghost.pid!);
+    check("ledger entry without start never kills", gInfo !== undefined && !DEAD_STATES.has(gInfo.state));
+    await dG.close();
+    ghost.kill("SIGKILL");
+    await rm(ghostDir, { recursive: true, force: true }).catch(() => {});
+
+    // Late-fork member (independent review repro): a member forked AFTER
+    // the ledger's last append is still ours — the group dies with its
+    // dead leader. The delayed writer is forked ~5s after the ledger append;
+    // reaping must prevent its side effect even if /proc retains zombies.
+    const lateDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-late-"));
+    const lateSideEffect = path.join(lateDir, "late-fork.txt");
+    const leader = spawn("sh", ["-c", 'sleep 5; (sleep 3; printf escaped > "$1") &', "late-fork", lateSideEffect], { detached: true, stdio: "ignore" });
+    leader.unref();
+    const ownedMembers = new Map<number, string>();
+    const liveMembers = (): number[] => {
+      const pids = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" })
+        .stdout?.toString().trim().split("\n").filter(Boolean).map(Number) ?? [];
+      return pids.filter((pid) => {
+        const info = procInfo(pid);
+        if (info === undefined || info.pgrp !== leader.pid || DEAD_STATES.has(info.state)) return false;
+        ownedMembers.set(pid, info.start);
+        return true;
+      });
+    };
+    try {
+      await writeFile(path.join(lateDir, "tool-children.jsonl"),
+        JSON.stringify({ pid: leader.pid, start: processStartTime(leader.pid!) }) + "\n");
+      const leaderGone = await waitFor("late-fork leader exited", () => {
+        const info = procInfo(leader.pid!);
+        return info === undefined || DEAD_STATES.has(info.state);
+      }, 15_000, 200);
+      const membersBefore = liveMembers();
+      const dL = await DurableDaemon.open({ stateDir: lateDir, providers: [] });
+      let nLate: number;
+      try {
+        nLate = await dL.reapOrphanedToolChildren();
+      } finally {
+        await dL.close();
+      }
+      const reaped = await waitFor("late-fork group stopped executing", () => liveMembers().length === 0, 2_000, 100);
+      const membersAfter = liveMembers();
+      check(
+        "member forked after last ledger append still reaped",
+        leaderGone && membersBefore.length > 0 && nLate === 1 && reaped,
+        `leader=${leader.pid} live members=${membersBefore.join(",")}→${membersAfter.join(",")} reaped=${nLate}`,
+      );
+      await sleep(3_500);
+      check("late-fork delayed side-effect never landed", !existsSync(lateSideEffect));
+    } finally {
+      // Only clean up processes from this fixture whose recorded identities
+      // still match; a failed assertion must not leave delayed writers behind.
+      liveMembers();
+      for (const [pid, start] of ownedMembers) {
+        const info = procInfo(pid);
+        if (info?.start === start && info.pgrp === leader.pid && !DEAD_STATES.has(info.state)) {
+          try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+        }
+      }
+      leader.kill("SIGKILL");
+      await waitExit(leader);
+      await rm(lateDir, { recursive: true, force: true }).catch(() => {});
+    }
+
+    // A second `serve` on a live state dir must refuse WITHOUT killing the
+    // running host's tool children (reaping runs post-lock only).
+    const serveDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-srvsafe-"));
+    const srvPort = await freePort();
+    const srv1 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", serveDir, "--port", String(srvPort)], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let srv1Out = "";
+    srv1.stdout.on("data", (d) => (srv1Out += String(d)));
+    srv1.stderr.on("data", (d) => (srv1Out += String(d)));
+    const srvUp = await waitFor("first serve up", async () =>
+      (await fetch(`http://127.0.0.1:${srvPort}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+    // Now the ledger gains an entry — as if the live daemon's tool spawned
+    // it. A second `serve` must die at the lock WITHOUT reaping it.
+    const worker = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    worker.unref();
+    await sleep(300);
+    await writeFile(path.join(serveDir, "tool-children.jsonl"),
+      JSON.stringify({ pid: worker.pid, start: processStartTime(worker.pid!) }) + "\n");
+    const second = await runCli(serveDir, ["serve", "--port", String(await freePort())]);
+    check("second serve refused", second.code !== 0, second.out.trim().slice(-60));
+    const wInfo = procInfo(worker.pid!);
+    check(
+      "refused second serve did not kill the live host's children",
+      srvUp && wInfo !== undefined && !DEAD_STATES.has(wInfo.state),
+      `serve=${srvUp} worker=${wInfo?.state ?? "gone"}`,
+    );
+    srv1.kill("SIGTERM");
+    await waitExit(srv1, 15_000);
+    worker.kill("SIGKILL");
+    await rm(serveDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // ── O4: legacy DB with a truly lost projection is rebuilt ────────────
+  // Fixture = durable truth (settled submission + delivered outcome frame)
+  // with the projection surgically absent — what a real old-version crash
+  // between outcome commit and registry projection leaves on disk. Remove
+  // the new receipt-version marker too: a current-schema atomic projection
+  // cannot be lost independently, and must not be mistaken for old state.
+  const dLost = await DurableDaemon.open({ stateDir, providers: [] });
+  const { record: lost } = await dLost.createAgent({ name: "lostproj", model: MODEL });
+  const { record: kept } = await dLost.createAgent({ name: "keptproj", model: MODEL });
+  await dLost.postMessage(lost.agentId, "hello");
+  await dLost.postMessage(kept.agentId, "hello");
+  const both = await waitFor("both legacy submissions settle", async () => {
+    const rs = await dLost.listAgents();
+    return [lost.agentId, kept.agentId].every((id) => {
+      const r = rs.find((a) => a.agentId === id);
+      return ((r?.runs ?? 0) + (r?.failures ?? 0)) >= 1;
+    });
+  }, 60_000, 500);
+  check("two legacy submissions settled", both);
+  // The projected record IS the truth — capture it before destroying it.
+  const beforeLost = (await dLost.listAgents()).find((a) => a.agentId === lost.agentId);
+  const beforeKept = (await dLost.listAgents()).find((a) => a.agentId === kept.agentId);
+  await dLost.harness.commit(async (tx) => {
+    const doc = await tx.doc(AgentsDoc);
+    const rl = doc.records[lost.agentId];
+    if (rl) {
+      rl.runs = 0; rl.failures = 0; rl.lastOutcome = null; rl.terminalFailure = null;
+      delete (rl as { projectedSubmissions?: string[] }).projectedSubmissions;
+      delete rl.outcomeReceiptsVersion;
+    }
+    const rk = doc.records[kept.agentId];
+    if (rk) {
+      delete (rk as { projectedSubmissions?: string[] }).projectedSubmissions;
+      delete rk.outcomeReceiptsVersion;
+    }
+  }, BACKGROUND_CONTEXT);
+  await dLost.close();
+  const dLost2 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLost2.resume();
+  await sleep(500);
+  const rLost = (await dLost2.listAgents()).find((a) => a.agentId === lost.agentId);
+  const rKept = (await dLost2.listAgents()).find((a) => a.agentId === kept.agentId);
+  check(
+    "lost projection rebuilt to the true counters (runs/failures/lastOutcome)",
+    rLost?.runs === beforeLost?.runs &&
+      rLost?.failures === beforeLost?.failures &&
+      rLost?.lastOutcome?.status === beforeLost?.lastOutcome?.status &&
+      rLost?.lastOutcome !== undefined,
+    `runs=${rLost?.runs}/${beforeLost?.runs} failures=${rLost?.failures}/${beforeLost?.failures} last=${rLost?.lastOutcome?.status ?? "null"}`,
+  );
+  check(
+    "already-projected record lands identical counters on rebuild",
+    rKept?.runs === beforeKept?.runs && rKept?.failures === beforeKept?.failures,
+    `runs=${rKept?.runs}/${beforeKept?.runs} failures=${rKept?.failures}/${beforeKept?.failures}`,
+  );
+  await dLost2.close();
+  const dLost3 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLost3.resume();
+  await sleep(500);
+  const rLost3 = (await dLost3.listAgents()).find((a) => a.agentId === lost.agentId);
+  check("rebuild is idempotent across resumes", (rLost3?.runs ?? 0) + (rLost3?.failures ?? 0) === 1, `runs=${rLost3?.runs} failures=${rLost3?.failures}`);
+  await dLost3.close();
+
+  // ── O5: wrapper — concurrent requests share one bring-up; thin CLI ───
+  let PY = "";
+  for (const cand of ["/tmp/wtest/venv/bin/python3", "python3"]) {
+    if (spawnSync(cand, ["-c", "import fastapi,uvicorn,httpx"], { stdio: "pipe" }).status === 0) {
+      PY = cand;
+      break;
+    }
+  }
+  if (!PY) {
+    skip("wrapper shared readiness + thin CLI", "no python with fastapi/uvicorn/httpx (python3 -m pip install ./deploy)");
+  } else {
+    const wstate = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wstate-"));
+    const wdata = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wdata-"));
+    const pubPort = await freePort();
+    const childPort = await freePort();
+    const wrap = spawn(PY, ["-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", String(pubPort)], {
+      cwd: path.join(REPO_ROOT, "deploy"),
+      env: {
+        ...process.env,
+        RAFTD_STATE: wstate, RAFTD_DATA: wdata, RAFTD_REPO: REPO_ROOT,
+        RAFTD_CHILD_PORT: String(childPort), PORT: String(pubPort),
+        RAFTD_KEY: "e2ekey", NODE_BIN: process.execPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let wOut = "";
+    wrap.stdout.on("data", (d) => (wOut += String(d)));
+    wrap.stderr.on("data", (d) => (wOut += String(d)));
+    const up = await waitFor("wrapper healthy", async () =>
+      (await fetch(`http://127.0.0.1:${pubPort}/healthz`).catch(() => null))?.ok ?? false, 90_000, 500);
+    check("wrapper up with child", up, wOut.trim().slice(-120));
+    if (up) {
+      // SIGKILL the real child, then hammer: every waiter must share ONE
+      // bring-up — no live-pid-without-listen false positives.
+      let childPid = 0;
+      try {
+        childPid = Number(execSync(`pgrep -f "cli.ts serve --state ${wstate}"`).toString().trim().split("\n")[0]);
+      } catch { /* lookup failed */ }
+      check("wrapper child located for SIGKILL", childPid > 0);
+      if (childPid > 0) process.kill(childPid, "SIGKILL");
+      await sleep(400);
+      const codes = await Promise.all(
+        [...Array(16)].map(() =>
+          fetch(`http://127.0.0.1:${pubPort}/api/state`, { headers: { authorization: "Bearer e2ekey" } })
+            .then((r) => r.status).catch(() => -1),
+        ),
+      );
+      const ok200 = codes.filter((c) => c === 200).length;
+      check("16 concurrent post-crash requests all 200 (shared readiness)", ok200 === 16, JSON.stringify(codes));
+      const cli = await runCli(wstate, ["list"], { RAFTD_KEY: "e2ekey" });
+      check("thin CLI works through published public port", cli.code === 0, cli.out.trim().slice(0, 80));
+      const portFile = (await readFile(path.join(wstate, "raftd.port"), "utf8")).trim();
+      const internalFile = (await readFile(path.join(wstate, "raftd.internal-port"), "utf8")).trim();
+      check(
+        "raftd.port names the PUBLIC entry; internal-port keeps the child",
+        portFile === `127.0.0.1:${pubPort}` && internalFile === `127.0.0.1:${childPort}`,
+        `port=${portFile} internal=${internalFile}`,
+      );
+    }
+    // Hard refusal is an explicit 503, never a 500/502: a wrapper whose
+    // child can never spawn (NODE_BIN points nowhere → Popen throws inside
+    // _bring_up) must refuse cleanly.
+    const refusePort = await freePort();
+    const badState = await mkdtemp(path.join(tmpdir(), "raftd-e2e-badstate-"));
+    const wrapBad = spawn(PY, ["-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", String(refusePort)], {
+      cwd: path.join(REPO_ROOT, "deploy"),
+      env: {
+        ...process.env,
+        RAFTD_STATE: badState, RAFTD_DATA: await mkdtemp(path.join(tmpdir(), "raftd-e2e-baddata-")),
+        RAFTD_REPO: REPO_ROOT, RAFTD_CHILD_PORT: String(await freePort()),
+        PORT: String(refusePort), RAFTD_KEY: "e2ekey", NODE_BIN: "/nonexistent/raftd-node",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const badListening = await waitFor("broken wrapper listening", async () => {
+      const r = await fetch(`http://127.0.0.1:${refusePort}/healthz`).catch(() => null);
+      return r !== null; // any HTTP response = socket up (healthz 503s by design)
+    }, 60_000, 300);
+    const r503 = badListening
+      ? await fetch(`http://127.0.0.1:${refusePort}/api/state`, { headers: { authorization: "Bearer e2ekey" } }).then((r) => r.status).catch(() => -1)
+      : -1;
+    check("unspawnable child refuses with explicit 503", r503 === 503, `status=${r503}`);
+    wrapBad.kill("SIGTERM");
+    await waitExit(wrapBad, 15_000);
+    await rm(badState, { recursive: true, force: true }).catch(() => {});
+    wrap.kill("SIGTERM");
+    await waitExit(wrap, 15_000);
+    await rm(wstate, { recursive: true, force: true }).catch(() => {});
+    await rm(wdata, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // ── O6: real Docker build + run (when a daemon is available) ─────────
+  const dockerOk = spawnSync("docker", ["info"], { stdio: "pipe", timeout: 20_000 }).status === 0;
+  if (!dockerOk) {
+    skip("docker build + run matrix", "docker daemon unavailable");
+  } else {
+    const tag = `raftd-e2e:${GIT_SHA.slice(0, 12)}`;
+    const b = spawnSync("docker", ["build", "-f", "deploy/Dockerfile", "-t", tag, "."], { cwd: REPO_ROOT, stdio: "pipe", timeout: 900_000 });
+    check("docker image builds from root context", b.status === 0, b.stderr?.toString().slice(-200) ?? "");
+    if (b.status === 0) {
+      const pubPort = await freePort();
+      const name = `raftd-e2e-${Math.random().toString(36).slice(2, 8)}`;
+      spawnSync("docker", ["run", "-d", "--name", name, "-e", "RAFTD_KEY=e2ekey", "-e", "PORT=8080", "-p", `${pubPort}:8080`, tag], { stdio: "pipe", timeout: 60_000 });
+      const up = await waitFor("container healthy", async () =>
+        (await fetch(`http://127.0.0.1:${pubPort}/healthz`).catch(() => null))?.ok ?? false, 120_000, 1_000);
+      check("container healthy", up);
+      if (up) {
+        const st = await fetch(`http://127.0.0.1:${pubPort}/api/state`, { headers: { authorization: "Bearer e2ekey" } }).then((r) => r.status).catch(() => -1);
+        check("authed /api/state in container", st === 200, `status=${st}`);
+        const hash = spawnSync("docker", ["exec", name, "sha256sum", "/raftbuild-durable/packages/agent/src/machineLock.ts"], { stdio: "pipe", timeout: 30_000 });
+        const localHash = spawnSync("sha256sum", [path.join(PKG_DIR, "src", "machineLock.ts")], { stdio: "pipe" });
+        const imgHash = hash.stdout?.toString().split(" ")[0];
+        const srcHash = localHash.stdout?.toString().split(" ")[0];
+        check("image source matches this commit", imgHash === srcHash, `img=${imgHash} src=${srcHash}`);
+        // Match Dockerfile's RAFTD_STATE. An unused directory lets the CLI
+        // open an empty offline daemon and return 0 without testing auth.
+        const dockerState = "/data/raftd";
+        const created = await fetch(`http://127.0.0.1:${pubPort}/api/agents`, {
+          method: "POST",
+          headers: { authorization: "Bearer e2ekey", "content-type": "application/json" },
+          body: JSON.stringify({ name: "docker-cli-probe", model: `${MODEL.provider}/${MODEL.modelId}` }),
+        });
+        const probe = await created.json() as { agentId?: string };
+        check("HTTP creates Docker CLI probe agent", created.status === 201 && typeof probe.agentId === "string", `status=${created.status} agent=${probe.agentId}`);
+        const cliArgs = [name, "node", "--experimental-transform-types", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", dockerState];
+        const cli = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=e2ekey", ...cliArgs], { stdio: "pipe", timeout: 60_000 });
+        const cliOut = cli.stdout?.toString() ?? "";
+        check("thin CLI inside container reads the HTTP-created agent", cli.status === 0 && typeof probe.agentId === "string" && cliOut.includes(probe.agentId) && cliOut.includes("docker-cli-probe"), `${cliOut.trim()} ${cli.stderr?.toString() ?? ""}`.slice(-200));
+        const rejected = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=wrong-e2e-key", ...cliArgs], { stdio: "pipe", timeout: 60_000 });
+        const rejectedOut = `${rejected.stdout?.toString() ?? ""}\n${rejected.stderr?.toString() ?? ""}`;
+        check("thin CLI inside container rejects a wrong public key", rejected.status !== null && rejected.status !== 0 && /401|unauthorized/i.test(rejectedOut), rejectedOut.trim().slice(-160));
+      }
+      spawnSync("docker", ["rm", "-f", name], { stdio: "pipe", timeout: 30_000 });
+    }
+  }
+}
+
 async function phaseL(stateDir: string) {
   phase("L — hardening regressions");
 
@@ -777,6 +1517,9 @@ try {
   await phaseJ(STATE_DIR, record.agentId);
   await phaseK(STATE_DIR);
   await phaseL(STATE_DIR);
+  await phaseM(STATE_DIR);
+  await phaseN(STATE_DIR);
+  await phaseO(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));
@@ -788,13 +1531,17 @@ const failed = checks.filter((c) => !c.ok);
 const report = [
   `# E2E report — raftbuild-durable`,
   ``,
-  `stateDir: \`${STATE_DIR}\`  model: ${MODEL.provider}/${MODEL.modelId}  duration: ${((Date.now() - t0) / 1000).toFixed(0)}s`,
+  `commit: \`${GIT_SHA}\`  node: ${process.version}  model: ${MODEL.provider}/${MODEL.modelId}  duration: ${((Date.now() - t0) / 1000).toFixed(0)}s`,
+  `stateDir: \`${STATE_DIR}\``,
   ``,
+  ...(skipped.length > 0
+    ? [`## Skipped (not counted as pass)`, ``, ...skipped.map((s) => `- **${s.phase}** ${s.name}: ${s.reason}`), ``]
+    : []),
   `| phase | check | result | detail |`,
   `|---|---|---|---|`,
   ...checks.map((c) => `| ${c.phase} | ${c.name} | ${c.ok ? "PASS" : "FAIL"} | ${c.detail.replace(/\|/g, "\\|").replace(/\n/g, " ")} |`),
   ``,
-  `${checks.length - failed.length}/${checks.length} checks passed.`,
+  `${checks.length - failed.length}/${checks.length} checks passed; ${skipped.length} skipped.`,
 ].join("\n");
 await mkdir(path.dirname(REPORT), { recursive: true });
 await writeFile(REPORT, report);

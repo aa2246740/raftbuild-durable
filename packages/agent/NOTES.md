@@ -1,5 +1,25 @@
 # daemon → pi-durable 移植笔记
 
+## issue #2 四轮复测修复
+
+以下是当前实现；后面的轮次表保留当时的修复记录。
+
+- 单实例锁改为 `raftd.lock.sqlite` 的持续 SQLite 写事务。暂停不释放，进程死亡自动释放，
+  不再收割/重建 takeover 目录。JSON 仅诊断与旧协议活 owner 防护；CLI 在打开 Harness 前拿锁。
+  锁数据库必须保留且仅由 SQLite 管理；升级前先停止旧二进制，使用支持 SQLite 文件锁的本地 state。
+- outcome 的 `produced` / `projected` 存在每 submission 的固定大小 durable receipt，
+  与 outbox frame、registry 投影同事务。旧 bounded ledger 不再决定 outcome 去重。
+  迁移可分批中断重启，并从 settled records 重建准确计数；旧 ring/live queue/default delivery ledger
+  证明已经产出的帧不会重产。自定义 transport 无交付账本且旧前缀已被遗忘时，按至少一次语义保守补发，
+  新 receipt 随后永久记住。128 条 outbox 的慢消费者/故障 fail-closed 规则保持。
+- 原生 CLI 和 wrapper 都先持有永久 `raftd.wrapper.sqlite` 宿主锁，再获取 storage 锁；
+  wrapper child 由宿主管理，只获取 storage 锁。重复实例及 child 恢复空窗不能覆盖公开发现；
+  child 只写内部发现；每次 child 启动有独立实例身份，
+  readiness 和响应都验证身份/存活，公开响应去掉内部身份头。健康 up 包含公开发现已就绪。
+  共享启动不受单个请求取消影响；写请求上游断连后不盲重放可能已经提交的操作。
+- `pnpm test:reliability` 无需模型 key，实际验证锁、4096 历史边界和 Python/Node wrapper。
+  E2E 后代检查排除非执行 zombie 并验证延迟副作用；Docker CLI 必须从实际 state 读到 HTTP 创建的 agent。
+
 ## 对照关系（先说人话版）
 
 Raft daemon 的方式：agent 是**外部进程**——daemon 按 runtime 类型（claude / codex / pi）
@@ -105,3 +125,52 @@ durable systemNotice（"Host restarted — resuming N unfinished submission(s)"�
 
 上游示例全集在 pi 仓库 `packages/durable/test/examples/`（00–31，见 earendil-works/pi
 GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/13-recovery.ts）。
+（GitHub issue #2 评审修复）
+
+| 发现 | 修法 |
+|---|---|
+| MachineLock 并发/接管双竞态 | tmp 文件 + `link()` 原子创建（读者永远看不到半写锁）；接管 `rename()` 原子认领后删 |
+| `markUnreliable` 持久化失败丢内存标 | 先置 `memoryUnreliable`，只有显式 `resolve` 能清 |
+| 送达账本 (agentId,clientSeq) 可重复 | `JsonlDeliveryTransport` 启动回放 ledger 建 seq 集合，重复 clientSeq 直接跳过 |
+| outcome 提交与 registry 投影可被崩溃拆开 | `outbox.append(frame, key, inTx)` —— 帧+幂等键+AgentsDoc 投影一个事务落；重复路径幂等修复 |
+| SIGKILL 后工具孤儿进程残留 | `open()` 时扫 `/proc`：cwd 在 workspaces/ 下的进程按 pgid 整组 SIGKILL（Linux 尽力而为）；文档不再说 "no child processes" |
+| "workspace 沙箱" 名不副实 | 文档改口：cwd 约定非硬隔离 |
+| 非 loopback 无 RAFTD_KEY 只警告 | 拒绝启动；`RAFTD_INSECURE=1` 显式裸奔；薄 CLI 自动带 Bearer |
+| `main` 可被创建但收不到路由 | createAgent 拒绝该名（保留给 operator inbox） |
+| answer 路由不验归属 | 先 404 解析 agent，再校验 submission ∈ 其 conversation |
+| 默认模型写死 GLM | `pickDefaultModel(providers)` 按已配置 provider 选 |
+| Node ≥22.7 声明错误 | README/`engines` 改 ≥24（`node:sqlite`） |
+| HTTP 校验一堆洞 | body 非 object→400、name/text/when 类型+非空→400、busy reject→409、`at 25:99`→400 |
+| 提醒投递失败丢定时器 | fire 失败 → +60s 重布防；startAgent/resolveAgent 触发 resync |
+| 薄 CLI remote 不一致 | create 转发 workspace/thinking；`deliveries` 无参走 `/api/deliveries`；HTTP 错误原文上抛不伪装 unreachable |
+| 控制台发送失败清输入 | 成功才清空；错误横幅提示；390px 窄屏纵向布局 |
+| IPv6 `--host ::1` | URL/端口文件都带 `[]` |
+| 云包装层 | 认证化就绪探测、`?key=`→Bearer 注入、child 死后按需重生+503 healthz、SIGTERM 收 child、`/setup/env` 全 provider+merge 不重写 |
+
+## issue #2 二轮复测修复（PR #3 追加）
+
+| 发现 | 修法 |
+|---|---|
+| stale-lock 接管仍在 inspect→replace 窗口竞态 | 换协议：`<lock>.takeover/` mkdir 原子互斥，临界区内重新 inspect（inode 变化=让位），删锁改 unlink，link() 仍是唯一创建通道。32并发×60轮实测单持有者 |
+| 孤儿清理误杀/漏杀（cwd 归属） | 台账制：`activeChildPids.add` 挂钩在 spawn 时记 {pid,内核starttime} 到 `tool-children.jsonl`（三轮改为 `serve` 拿锁后收割，见下表） |
+| 升级旧状态 outcome 重复计数 | legacy 迁移：`projectedSubmissions === undefined` 的 record 由 reconcile 重建（三轮改为从 settled submissions 重算 counters/lastOutcome/terminalFailure，见下表） |
+
+| whenBusy=reject 返回 500 | statusFor 正则放宽 `\bis busy\b`（"Conversation 2 is busy" 带 id 不再漏）→409 |
+| 390px 输入栏溢出 | composer `flex-wrap` + input `order:-1 flex:1 1 100%`，窄屏两行排列 |
+| wrapper 代理全 500 | httpx 0.28 没有 `request(stream=)` → `build_request`+`send(stream=True)`；响应生命周期交给 `StreamingResponse(background=BackgroundTask(aclose))`，去掉非法 `async with` |
+| wrapper 公网无鉴权 | 外部 Bearer/`?key=` 先验 admin key 才放行 /api/*、`/setup/*`；admin key=RAFTD_KEY 或持久化 `STATE/admin-key`（自动生成+写日志）；child 用独立内部 key，调用者凭据不转发 |
+| SIGTERM 杀 child 但父不退 | 删自定义 signal handler，child 清理挪进 FastAPI lifespan shutdown，uvicorn 退出链路完整 |
+| Docker 打包过期 daemon | 删 tracked `repo.tar.gz`；Dockerfile 改从仓库根 COPY 当前源码构建；fly.toml 移到根 + `dockerfile=deploy/Dockerfile`；加 `.dockerignore` |
+| wrapper 升级丢旧配置/query-key | `_load_envfile()` 合并 `STATE/child.env`→`DATA/.env`（旧 key 保留）；setup 端点恢复接受 `?key=` |
+
+## issue #2 三轮复测修复（PR #3 追加）
+
+| 发现 | 修法 |
+|---|---|
+| takeover 互斥 30s-mtime 强拆会杀掉被 SIGSTOP 冻结的活持有者 | `owner.json` 身份文件：{pid, token, startedAt, pidStart}；owner 活（含 T 态）→ 永不收割；死/僵死/pid 复用 → 立即收割；无 owner 文件才退回 30s mtime；rm 前复查 inode+owner（防收割-重建 TOCTOU） |
+| 台账漏掉 leader 死后的后台进程组、pid 复用历史、缺 start 行误杀 | leader 死 → 枚举 pgrp=pid 的全部存活成员整组 SIGKILL（成员启动时间须 ≥ leader 启动时间——复核后删掉了会系统性漏杀的上界）；pid 复用不消费；缺 start 保守跳过 |
+| 二次 `serve`/`open` 会在拿锁前收割活 daemon 的子进程 | 收割移出 `open()`：`serve` 在 `MachineLock.acquire` 之后才跑 `reapOrphanedToolChildren()`；一次性命令永不收割 |
+| 老库丢投影被祖父条款掩盖 | 不再跳过：从 durable settled submissions 重建 runs/failures/lastOutcome/terminalFailure，幂等 |
+| zombie 锁主被 kill(0) 判活 | `processAlive` 先读 /proc state（Z/X/x=死），无 /proc 才退回 kill(0)/EPERM |
+| wrapper 崩溃后并发首请求 15/16×502 | `_ensure_up()` 共享 bring-up 任务，所有请求等同一个；硬拒绝显式 503（`_bring_up` 异常也归一为 False） |
+| 薄 CLI 在 wrapper/Docker 里 401 | `raftd.port` 写公网入口 `127.0.0.1:$PORT`；子进程端口另存 `raftd.internal-port` |

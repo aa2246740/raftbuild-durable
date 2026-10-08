@@ -7,8 +7,8 @@
  * "Daemon" here is a lifetime, not a process: `open()` on an existing state
  * dir IS the restart — unfinished work resumes via `harness.resume()`.
  */
-import { mkdir, appendFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, appendFile, rm, readdir, readFile, stat } from "node:fs/promises";
+import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -27,6 +27,7 @@ import {
   type Storage,
   type SubmissionId,
   type SubmissionRecord,
+  type Tx,
 } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -50,7 +51,8 @@ import {
   type WorkspaceDirectoryInfo,
 } from "./workspaces.ts";
 import { DurableEventNormalizer } from "./events.ts";
-import { AgentOutbox, OutboxDoc, OutboxError } from "./outbox.ts";
+import { DEAD_STATES, procInfo, processStartTime } from "./machineLock.ts";
+import { AgentOutbox, OutboxDoc, OutboxError, OutcomeReceiptDoc, outcomeReceiptKey } from "./outbox.ts";
 import { JsonlDeliveryTransport, type OutboxTransport } from "./transport.ts";
 import { terminalFailureFromRawText, turnCompletedOutcome } from "./outcome.ts";
 import type {
@@ -162,6 +164,8 @@ export class DurableDaemon {
     readonly providerCount: number,
   ) {}
 
+  private readonly outcomeMigrations = new Map<string, Promise<void>>();
+  private readonly outcomeReceiptsReady = new Set<string>();
   private readonly outboxes = new Map<string, AgentOutbox>();
   private readonly pumps = new Map<string, { stop: () => Promise<unknown> }>();
   private readonly normalizers = new Map<string, DurableEventNormalizer>();
@@ -207,13 +211,19 @@ export class DurableDaemon {
         settings: options.settings,
         env: (target) => {
           const cwd = target.cwd ?? workspacesDir;
-          return new NodeExecutionEnv({ cwd });
+          const env = new NodeExecutionEnv({ cwd });
+          trackToolChildren(env, stateDir);
+          return env;
         },
       },
       BACKGROUND_CONTEXT,
     );
 
     const transport = options.transport ?? new RoutingTransport(new JsonlDeliveryTransport(deliveriesDir));
+    const resolved = {
+      ...options,
+      defaultModel: options.defaultModel ?? pickDefaultModel(providers),
+    } as Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions;
     const daemon = new DurableDaemon(
       stateDir,
       workspacesDir,
@@ -223,7 +233,7 @@ export class DurableDaemon {
       harness,
       registry,
       transport,
-      options as Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions,
+      resolved,
       providers.length,
     );
     if (transport instanceof RoutingTransport) {
@@ -276,6 +286,21 @@ export class DurableDaemon {
     return count;
   }
 
+  /**
+   * Kill tool processes a PREVIOUS host left behind. Must only run while
+   * this process owns the state dir (i.e. after MachineLock.acquire in
+   * `serve`): on a live host's dir it would kill the running daemon's
+   * children, which is why open() itself never reaps — one-shot CLI opens
+   * (`send`, `list`) race a live daemon all the time.
+   */
+  async reapOrphanedToolChildren(): Promise<number> {
+    const n = await reapOrphanedToolChildren(this.stateDir);
+    if (n > 0) {
+      this.opts.onWarn?.(`reaped ${n} orphaned tool process(es) left by a previous host (SIGKILL window)`);
+    }
+    return n;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -296,6 +321,11 @@ export class DurableDaemon {
     const model = config.model ?? this.opts.defaultModel;
     if (!model) {
       throw new Error("createAgent needs a model (or a daemon defaultModel)");
+    }
+    // "main" is the routing target for the operator inbox — an agent by that
+    // name would never receive peer-routed messages.
+    if (config.name === "main") {
+      throw new AgentRegistryError('"main" is reserved for the operator inbox — pick another name', "invalid");
     }
     const agentId = `agent-${randomUUID().slice(0, 8)}`;
     const workspaceName = config.workspace ?? agentId;
@@ -351,6 +381,8 @@ export class DurableDaemon {
       lastOutcome: null,
       runs: 0,
       failures: 0,
+      projectedSubmissions: [],
+      outcomeReceiptsVersion: 1,
     };
     try {
       await this.harness.commit(async (tx) => {
@@ -443,6 +475,9 @@ export class DurableDaemon {
         rec.updatedAt = new Date().toISOString();
       }
     }, BACKGROUND_CONTEXT);
+    // A started agent may have reminders whose fire failed while it was
+    // stopped — re-arm them now (resolveAgent delegates here too).
+    this.reminderHook?.();
   }
 
   /** Human outbox resolution — the daemon's admitted human start. */
@@ -537,6 +572,18 @@ export class DurableDaemon {
     if (!submission) throw new Error(`unknown submission: ${submissionId}`);
     const settled = await submission.wait(BACKGROUND_CONTEXT);
     return this.readAnswer(settled);
+  }
+
+  /** Which agent owns a submission (for API ownership checks); undefined = unknown. */
+  async submissionOwner(submissionId: string): Promise<string | undefined> {
+    const sub = await this.harness
+      .submission(Number(submissionId) as SubmissionId, BACKGROUND_CONTEXT)
+      .catch(() => undefined);
+    if (!sub) return undefined;
+    const rec = await sub.status(BACKGROUND_CONTEXT).catch(() => undefined);
+    if (!rec) return undefined;
+    const records = await this.listAgents();
+    return records.find((r) => r.conversationId === String(rec.conversationId))?.agentId;
   }
 
   /**
@@ -920,14 +967,15 @@ export class DurableDaemon {
 
   /**
    * Turn a settled submission into an E1/E2 outbox frame, exactly once.
-   * Dedupe rides on OutboxDoc.producedSubmissionIds so a reopen cannot
-   * re-produce a frame a crashed watcher already wrote.
+   * Permanent per-submission receipts preserve identity even after arbitrarily
+   * long histories; frame, receipt and registry projection commit together.
    */
   private async produceOutcome(
     agentId: string,
     settled: Extract<ParsedEvent, { kind: "submission_settled" }>,
     run?: { counters: { textEvents: number; toolCalls: number; runtimeErrors: number }; sticky: boolean; firstError: string | null },
   ): Promise<void> {
+    await this.ensureOutcomeReceipts(agentId);
     let outcome;
     if (settled.status === "done") {
       const counters = run?.counters ?? { textEvents: 0, toolCalls: 0, runtimeErrors: 0 };
@@ -970,6 +1018,44 @@ export class DurableDaemon {
       };
     }
 
+    // Registry projection co-committed WITH the frame: one commit lands
+    // frame + dedupe key + lastOutcome/runs/terminalFailure, so a crash can
+    // never split "outcome delivered, projection lost". Pre-atomic states
+    // (a frame committed without projection) are repaired idempotently below.
+    const project = async (tx: Tx): Promise<void> => {
+      const doc = await tx.doc(AgentsDoc);
+      const record = doc.records[agentId];
+      if (!record) return;
+      const receipt = await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(agentId, settled.submissionId), settled.submissionId);
+      if (receipt.projected) return;
+      receipt.projected = true;
+      if (settled.status === "done") record.runs++;
+      else record.failures++;
+      // Only overwrite lastOutcome with a NEWER-or-equal submission — a
+      // late repair of an old submission must not clobber a newer one.
+      const cur = Number(record.lastOutcome?.submissionId ?? NaN);
+      const nxt = Number(settled.submissionId);
+      if (!record.lastOutcome || !Number.isFinite(cur) || !Number.isFinite(nxt) || nxt >= cur) {
+        record.lastOutcome = {
+          kind: outcome.kind,
+          status: settled.status,
+          submissionId: settled.submissionId,
+          reason: settled.status === "unanswered" ? (settled.reason ?? "unanswered") : null,
+          errorClass: outcome.kind === "terminal_failure" ? outcome.errorClass : null,
+          at: new Date().toISOString(),
+        };
+        if (outcome.kind === "terminal_failure" && outcome.errorAction !== null && outcome.errorAction !== "none") {
+          record.terminalFailure = {
+            failureKind: outcome.failureKind,
+            fingerprint: outcome.fingerprint,
+            detail: outcome.detail ?? settled.reason ?? "terminal failure",
+            at: new Date().toISOString(),
+          };
+        }
+      }
+      record.updatedAt = new Date().toISOString();
+    };
+
     const outbox = this.outboxFor(agentId);
     const appended = await outbox.append(
       {
@@ -979,78 +1065,157 @@ export class DurableDaemon {
         outcome,
       },
       settled.submissionId,
+      project,
     );
     if ("duplicate" in appended) return;
     this.opts.onFrame?.(agentId, appended.clientSeq);
-
-    await this.harness.commit(async (tx) => {
-      const doc = await tx.doc(AgentsDoc);
-      const record = doc.records[agentId];
-      if (!record) return;
-      record.lastOutcome = {
-        kind: outcome.kind,
-        status: settled.status,
-        submissionId: settled.submissionId,
-        reason: settled.status === "unanswered" ? (settled.reason ?? "unanswered") : null,
-        errorClass: outcome.kind === "terminal_failure" ? outcome.errorClass : null,
-        at: new Date().toISOString(),
-      };
-      if (settled.status === "done") record.runs++;
-      else record.failures++;
-      record.updatedAt = new Date().toISOString();
-      if (outcome.kind === "terminal_failure" && outcome.errorAction !== null && outcome.errorAction !== "none") {
-        record.terminalFailure = {
-          failureKind: outcome.failureKind,
-          fingerprint: outcome.fingerprint,
-          detail: outcome.detail ?? settled.reason ?? "terminal failure",
-          at: new Date().toISOString(),
-        };
-      }
-    }, BACKGROUND_CONTEXT);
   }
 
   /**
    * Sweep settled submissions that settled while no pump watched (e.g. daemon
    * was closed between place and settle) — produce any missing outcome frame.
    */
+  private async settledSubmissions(record: AgentRecord) {
+    const settled: { id: string; status: "done" | "unanswered"; reason?: string }[] = [];
+    for (const status of ["done", "unanswered"] as const) {
+      let cursor;
+      for (;;) {
+        const page = await this.storage.scanSubmissions(
+          { conversationId: Number(record.conversationId) as ConversationId, status },
+          100,
+          cursor,
+          BACKGROUND_CONTEXT,
+        );
+        for (const rec of page.items) {
+          settled.push({
+            id: String(rec.id),
+            status,
+            reason: status === "unanswered" ? rec.reason : undefined,
+          });
+        }
+        if (page.next === undefined) break;
+        cursor = page.next;
+      }
+    }
+    return settled;
+  }
+
   private async reconcileSubmissions(record: AgentRecord): Promise<void> {
-    let cursor;
-    for (;;) {
-      const page = await this.storage.scanSubmissions(
-        { conversationId: Number(record.conversationId) as ConversationId, status: "done" },
-        100,
-        cursor,
-        BACKGROUND_CONTEXT,
-      );
-      for (const rec of page.items) {
-        await this.produceOutcome(record.agentId, {
-          kind: "submission_settled",
-          submissionId: String(rec.id),
-          status: "done",
-        });
-      }
-      if (page.next === undefined) break;
-      cursor = page.next;
+    await this.ensureOutcomeReceipts(record.agentId);
+    const settled = await this.settledSubmissions(record);
+    for (const s of settled) {
+      const receipt = await this.harness.snapshot(OutcomeReceiptDoc, outcomeReceiptKey(record.agentId, s.id), BACKGROUND_CONTEXT);
+      if (receipt?.produced && receipt.projected) continue;
+      await this.produceOutcome(record.agentId, {
+        kind: "submission_settled",
+        submissionId: s.id,
+        status: s.status,
+        reason: s.reason,
+      });
     }
-    cursor = undefined;
-    for (;;) {
-      const page = await this.storage.scanSubmissions(
-        { conversationId: Number(record.conversationId) as ConversationId, status: "unanswered" },
-        100,
-        cursor,
-        BACKGROUND_CONTEXT,
-      );
-      for (const rec of page.items) {
-        await this.produceOutcome(record.agentId, {
-          kind: "submission_settled",
-          submissionId: String(rec.id),
-          status: "unanswered",
-          reason: rec.status === "unanswered" ? rec.reason : undefined,
-        });
-      }
-      if (page.next === undefined) break;
-      cursor = page.next;
+  }
+
+  /** All live watchers and explicit reconciliation wait for the same migration;
+   * otherwise a settlement racing upgrade could be counted, then overwritten. */
+  private async ensureOutcomeReceipts(agentId: string): Promise<void> {
+    if (this.outcomeReceiptsReady.has(agentId)) return;
+    let pending = this.outcomeMigrations.get(agentId);
+    if (!pending) {
+      pending = (async () => {
+        const record = (await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT))?.records[agentId];
+        if (!record) return;
+        if (record.outcomeReceiptsVersion !== 1) {
+          await this.migrateOutcomeReceipts(record, await this.settledSubmissions(record));
+        }
+        this.outcomeReceiptsReady.add(agentId);
+      })();
+      this.outcomeMigrations.set(agentId, pending);
     }
+    try { await pending; }
+    finally { if (this.outcomeMigrations.get(agentId) === pending) this.outcomeMigrations.delete(agentId); }
+  }
+
+  /** One-time, restartable migration of BOTH old schemas (absent or bounded
+   * projection ledger). Rebuild counters from durable settlements, never from
+   * an evicting set. Only evidence proves a frame was produced: the legacy
+   * ring, a live outbox entry, or the default delivery ledger. A custom
+   * transport's forgotten prefix is unknowable and is conservatively replayed
+   * once under the existing at-least-once contract, never silently discarded. */
+  private async migrateOutcomeReceipts(
+    record: AgentRecord,
+    settled: { id: string; status: "done" | "unanswered"; reason?: string }[],
+  ): Promise<void> {
+    const current = (await this.harness.snapshot(AgentsDoc, BACKGROUND_CONTEXT))?.records[record.agentId];
+    if (!current || current.outcomeReceiptsVersion === 1) return;
+    const outbox = await this.outboxFor(record.agentId).state();
+    const produced = new Set(outbox?.producedSubmissionIds ?? []);
+    for (const entry of outbox?.entries ?? []) {
+      if (entry.frame.type === "agent:runtime:outcome") produced.add(entry.frame.submissionId);
+    }
+    try {
+      const ledger = await readFile(path.join(this.deliveriesDir, `${record.agentId}.jsonl`), "utf8");
+      for (const line of ledger.split("\n")) {
+        try {
+          const envelope = JSON.parse(line) as OutboxEnvelope;
+          if (envelope.agentId === record.agentId && envelope.frame?.type === "agent:runtime:outcome") {
+            produced.add(envelope.frame.submissionId);
+          }
+        } catch { /* ignore torn final line; no proof means conservative replay */ }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    // Bounded batches keep each migration transaction small. The final version
+    // marker is written only AFTER all receipts, so a crash restarts safely.
+    for (let offset = 0; offset < settled.length; offset += 100) {
+      const batch = settled.slice(offset, offset + 100);
+      await this.harness.commit(async (tx) => {
+        for (const s of batch) {
+          const receipt = await tx.doc(OutcomeReceiptDoc, outcomeReceiptKey(record.agentId, s.id), s.id);
+          receipt.projected = true;
+          if (produced.has(s.id)) receipt.produced = true;
+        }
+      }, BACKGROUND_CONTEXT);
+    }
+    await this.harness.commit(async (tx) => {
+      const doc = await tx.doc(AgentsDoc);
+      const r = doc.records[record.agentId];
+      if (!r || r.outcomeReceiptsVersion === 1) return;
+      r.runs = settled.filter((s) => s.status === "done").length;
+      r.failures = settled.length - r.runs;
+      const latest = settled.reduce<(typeof settled)[number] | undefined>(
+        (prev, s) => !prev || Number(s.id) > Number(prev.id) ? s : prev, undefined,
+      );
+      if (latest) {
+        const evidence = latest.status === "done" ? undefined
+          : terminalFailureFromRawText(failureKindFor(latest.reason), latest.reason ?? "unanswered");
+        // An existing projection for this (or a newer) submission is also
+        // evidence that terminalFailure reflects subsequent human decisions.
+        // In particular resolveAgent() deliberately clears it; replaying the
+        // old diagnostic must not undo that resolution or replace richer data.
+        const projectedId = Number(r.lastOutcome?.submissionId);
+        if (!r.lastOutcome || !Number.isFinite(projectedId) || projectedId < Number(latest.id)) {
+          r.lastOutcome = {
+            kind: evidence ? "terminal_failure" : "turn_completed",
+            status: latest.status,
+            submissionId: latest.id,
+            reason: latest.status === "done" ? null : (latest.reason ?? "unanswered"),
+            errorClass: evidence?.errorClass ?? null,
+            at: new Date().toISOString(),
+          };
+          if (evidence && evidence.errorAction !== null && evidence.errorAction !== "none") {
+            r.terminalFailure = {
+              failureKind: evidence.failureKind,
+              fingerprint: evidence.fingerprint,
+              detail: evidence.detail ?? latest.reason ?? "terminal failure",
+              at: new Date().toISOString(),
+            };
+          }
+        }
+      }
+      r.projectedSubmissions = []; // obsolete ring; receipts are authoritative
+      r.outcomeReceiptsVersion = 1;
+    }, BACKGROUND_CONTEXT);
   }
 }
 
@@ -1059,6 +1224,168 @@ function failureKindFor(reason: string | undefined): TerminalFailureKind {
   if (/input.*too.*large|context.*too.*long|InputTooLargeError/i.test(text)) return "compaction_input_too_large";
   if (/compaction/i.test(text)) return "compaction_failed";
   return "sticky_runtime_error";
+}
+
+/**
+ * Pick a default model from the actually-configured providers (issue: a
+ * hardcoded GLM default meant `export OPENAI_API_KEY` alone created agents
+ * that always answered no_model). Preference order first, then the first
+ * model in the first provider's catalog.
+ */
+function pickDefaultModel(providers: readonly Provider[]): AgentModelRef | undefined {
+  const preferred: Record<string, string> = {
+    "zai-coding-cn": "glm-5.3-flash",
+  };
+  for (const p of providers) {
+    const want = preferred[p.id];
+    if (!want) continue;
+    try {
+      if (p.getModels().some((m) => m.id === want)) {
+        return { provider: p.id, modelId: want };
+      }
+    } catch {
+      /* catalog unreadable */
+    }
+  }
+  for (const p of providers) {
+    try {
+      const first = p.getModels()[0];
+      if (first) return { provider: p.id, modelId: first.id };
+    } catch {
+      /* catalog unreadable */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Orphaned tool children, tracked by LEDGER not by cwd.
+ *
+ * Tool subprocesses spawn detached (each is its own process-group leader,
+ * pgid === pid), so a host SIGKILL orphans them mid-side-effect while the
+ * durable run re-executes. Attributing orphans by "cwd under workspaces/"
+ * is wrong in both directions: it kills unrelated processes the user is
+ * running inside a workspace (editors, debugging), and it misses a real
+ * tool child that `cd`'d out of the workspace before the host died.
+ *
+ * Instead every spawn is recorded at birth in stateDir/tool-children.jsonl
+ * (pid + kernel starttime — the pid-reuse guard), and open() SIGKILLs the
+ * process groups of exactly those recorded pids that are still alive.
+ * Best-effort: a spawn torn down between exec() and the ledger write can
+ * still escape; a pid reused for a different process never matches because
+ * starttime differs.
+ */
+const TOOL_CHILDREN_FILE = "tool-children.jsonl";
+
+export function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void {
+  // NodeExecutionEnv keeps a private Set<number> of live child pids, added
+  // the moment spawn() returns — wrap add() so every spawn is journaled
+  // (sync append; spawn bookkeeping cannot await).
+  const holder = env as unknown as { activeChildPids?: unknown };
+  const pids = holder.activeChildPids;
+  if (!(pids instanceof Set)) return;
+  const file = path.join(stateDir, TOOL_CHILDREN_FILE);
+  const origAdd = pids.add.bind(pids);
+  pids.add = (pid: number): Set<number> => {
+    try {
+      appendFileSync(file, JSON.stringify({ pid, start: processStartTime(pid) }) + "\n");
+    } catch {
+      /* ledger is best-effort */
+    }
+    return origAdd(pid);
+  };
+}
+
+/** Live (non-zombie) processes whose process group equals `pgid`. */
+function liveGroupMembers(pgid: number): { pid: number; startJiffies: number }[] {
+  const out: { pid: number; startJiffies: number }[] = [];
+  try {
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      const info = procInfo(pid);
+      if (info === undefined || DEAD_STATES.has(info.state) || info.pgrp !== pgid) continue;
+      out.push({ pid, startJiffies: Number(info.start) });
+    }
+  } catch {
+    /* /proc unavailable */
+  }
+  return out;
+}
+
+async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
+  const file = path.join(stateDir, TOOL_CHILDREN_FILE);
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch {
+    return 0; // no ledger → nothing this daemon's lineage ever spawned
+  }
+  let reaped = 0;
+  const done = new Set<number>();
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let pid: number | undefined;
+    let start: string | undefined;
+    try {
+      const e = JSON.parse(line) as { pid?: number; start?: string };
+      pid = e.pid;
+      start = e.start;
+    } catch {
+      continue;
+    }
+    if (typeof pid !== "number" || pid <= 1 || pid === process.pid || done.has(pid)) continue;
+    const info = procInfo(pid);
+    if (info !== undefined && !DEAD_STATES.has(info.state)) {
+      if (start !== undefined && info.start === start) {
+        // Recorded leader still alive, identity proven → kill its group.
+        try {
+          process.kill(-pid, "SIGKILL"); // detached child = process-group leader
+          reaped++;
+        } catch {
+          try {
+            process.kill(pid, "SIGKILL");
+            reaped++;
+          } catch {
+            /* gone */
+          }
+        }
+        done.add(pid);
+      }
+      // Alive but start missing/mismatched → pid was RECYCLED by someone
+      // else's process — never touch it, and don't consume the pid either:
+      // a later ledger line may carry the real start for this pid.
+      continue;
+    }
+    // Leader dead/zombie — descendants may still run in pgrp === pid. A
+    // process group id only survives while members exist, and no new member
+    // can join a dead pid's group (a group id is recreated only by a
+    // setsid() from that same pid — which would need the pid alive again,
+    // in which case the start-mismatch branch above skips instead). So
+    // group members here are descendants of the recorded leader; they must
+    // only postdate the leader's own start.
+    // Residual corner (documented, astronomically rare): the pid recycled
+    // into a setsid'ing process which then ALSO died — its group shares the
+    // dead pgid and is indistinguishable from the recorded lineage. Safer
+    // than an upper time bound, which systematically spared real orphans
+    // that were forked after the ledger's last append.
+    if (start === undefined) continue; // no identity — conservative skip
+    const leaderJ = Number(start);
+    const members = liveGroupMembers(pid).filter((m) => m.pid !== pid);
+    if (members.length === 0) continue;
+    if (members.every((m) => m.startJiffies >= leaderJ)) {
+      try {
+        process.kill(-pid, "SIGKILL");
+        reaped++;
+        done.add(pid);
+      } catch {
+        /* group already gone */
+      }
+    }
+  }
+  // The ledger describes the previous lifetime — consumed once reaped.
+  await rm(file, { force: true }).catch(() => {});
+  return reaped;
 }
 
 async function detectEnvProviders(): Promise<Provider[]> {
