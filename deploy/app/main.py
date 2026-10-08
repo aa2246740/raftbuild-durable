@@ -1,29 +1,43 @@
-"""raftd cloud wrapper — uvicorn on $PORT, raftd serve child on 127.0.0.1:4893.
+"""raftd cloud wrapper — uvicorn on $PORT, raftd serve child on 127.0.0.1:$CHILD_PORT.
 
-Every request proxied; the child serves the web console + the full API.
-/setup/env writes provider keys to DATA_DIR/.env (raftd reads it on boot).
+Security model:
+- The PUBLIC edge is this wrapper. Every route except /healthz and the
+  console page (GET /) requires the admin key — `Authorization: Bearer` or
+  `?key=` (the web console passes the key as a query param).
+- The admin key is $RAFTD_KEY, else a generated key persisted at
+  $RAFTD_STATE/admin-key (printed to logs on first boot).
+- The child daemon always runs with its own internal RAFTD_KEY; the wrapper
+  strips whatever the caller sent and injects it — caller credentials are
+  verified HERE, never forwarded.
 
-State lives under $RAFTD_STATE (default /data/.raftd) — mount a Fly volume
-at /data so SQLite/deliveries survive deploys.
+Endpoints beyond the proxy: /healthz (public), /setup/env + /setup/restart
+(admin-keyed; manage provider keys durably in $RAFTD_DATA/.env, merged on
+top of the legacy $RAFTD_STATE/child.env so upgrades keep old config).
+
+State lives under $RAFTD_STATE (default /data/.raftd) — mount a volume at
+/data so SQLite/deliveries/admin-key survive deploys.
 """
 import asyncio
 import os
-import signal
+import secrets
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 DATA_DIR = Path(os.environ.get("RAFTD_DATA", "/data"))
-STATE = os.environ.get("RAFTD_STATE", str(DATA_DIR / ".raftd"))
+STATE = Path(os.environ.get("RAFTD_STATE", str(DATA_DIR / ".raftd")))
 CHILD_PORT = int(os.environ.get("RAFTD_CHILD_PORT", "4893"))
 REPO_ROOT = Path(os.environ.get("RAFTD_REPO", "/raftbuild-durable"))
 ENVFILE = DATA_DIR / ".env"
-ADMIN_KEY = os.environ.get("RAFTD_KEY", "").strip()
+LEGACY_ENVFILE = STATE / "child.env"  # pre-2026-10 location — still honored
+ADMIN_KEY_FILE = STATE / "admin-key"
 
 # Must stay in sync with detectEnvProviders() in packages/agent/src/daemon.ts.
 ENV_KEYS = (
@@ -37,25 +51,61 @@ ENV_KEYS = (
     "ANTHROPIC_API_KEY",
 )
 
-app = FastAPI(title="raftd cloud wrapper")
 _child: subprocess.Popen | None = None
 _client: httpx.AsyncClient | None = None
-_child_key: str | None = None
+_child_key = f"raftd-child-{secrets.token_hex(16)}"  # internal only, per boot
 
 
-def _headers() -> dict[str, str]:
-    return {"authorization": f"Bearer {_child_key}"} if _child_key else {}
+def _load_admin_key() -> str:
+    """Public-edge key: env wins, else a generated key persisted on the volume."""
+    env = os.environ.get("RAFTD_KEY", "").strip()
+    if env:
+        return env
+    try:
+        k = ADMIN_KEY_FILE.read_text().strip()
+        if k:
+            return k
+    except OSError:
+        pass
+    k = secrets.token_hex(16)
+    ADMIN_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ADMIN_KEY_FILE.write_text(k)
+    print(f"[raftd-wrapper] admin key: {k} (persisted at {ADMIN_KEY_FILE})", flush=True)
+    return k
 
 
-async def _wait_ready(timeout_s: int = 180) -> bool:
+ADMIN_KEY = _load_admin_key()
+
+
+def _authed(req: Request) -> bool:
+    """Caller must prove the PUBLIC key — Bearer header or ?key= query param."""
+    if req.headers.get("authorization") == f"Bearer {ADMIN_KEY}":
+        return True
+    return req.query_params.get("key") == ADMIN_KEY
+
+
+def _load_envfile() -> dict[str, str]:
+    """Provider env for the child: legacy child.env first, .env overrides."""
+    merged: dict[str, str] = {}
+    for f in (LEGACY_ENVFILE, ENVFILE):
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                merged[k.strip()] = v.strip()
+    return merged
+
+
+async def _wait_ready(timeout_s: int = 120) -> bool:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if _child is None or _child.poll() is not None:
             return False
         try:
-            # Authenticated probe — with a child key the unauthenticated
-            # request only ever sees 401 and readiness never lands.
-            r = await _client.get("/api/state", headers=_headers())
+            r = await _client.get("/api/state", headers={"authorization": f"Bearer {_child_key}"})
             if r.status_code == 200:
                 return True
         except httpx.HTTPError:
@@ -66,25 +116,21 @@ async def _wait_ready(timeout_s: int = 180) -> bool:
 
 def _spawn() -> bool:
     """Spawn the node child unless one is already alive. Returns spawned?"""
-    global _child, _child_key
+    global _child
     if _child is not None and _child.poll() is None:
         return False
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    if ENVFILE.exists():
-        for line in ENVFILE.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    # The child always gets a key on this bind: bearer protects the LAN
-    # side; the wrapper injects it on every proxied call.
-    _child_key = env.get("RAFTD_KEY", "").strip() or "raftd-cloud-internal"
+    env.update(_load_envfile())
+    # The child only ever sees the internal key — the public admin key is
+    # verified by the wrapper and never reaches the daemon's trust boundary.
     env["RAFTD_KEY"] = _child_key
+    env["RAFTD_STATE"] = str(STATE)
     node = env.get("NODE_BIN", "node")
     _child = subprocess.Popen(
         [node, "--experimental-transform-types",
          str(REPO_ROOT / "packages/agent/src/cli.ts"),
-         "serve", "--state", STATE, "--host", "127.0.0.1", "--port", str(CHILD_PORT)],
+         "serve", "--state", str(STATE), "--host", "127.0.0.1", "--port", str(CHILD_PORT)],
         env=env, stdout=sys.stdout, stderr=sys.stderr,
     )
     return True
@@ -105,22 +151,20 @@ def _stop_child() -> None:
             _child.wait(timeout=5)
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     global _client
-    _client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{CHILD_PORT}", timeout=httpx.Timeout(120.0))
-    # SIGTERM (Fly scale-down/deploy): reap the node child or it outlives us.
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, _stop_child)
-    loop.add_signal_handler(signal.SIGINT, _stop_child)
+    _client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{CHILD_PORT}",
+                                timeout=httpx.Timeout(120.0))
     asyncio.create_task(_ensure_up())
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
+    yield
+    # Uvicorn owns signal handling and reaches here on SIGTERM/SIGINT —
+    # reaping the child in lifespan keeps the parent's exit path intact.
     _stop_child()
-    if _client is not None:
-        await _client.aclose()
+    await _client.aclose()
+
+
+app = FastAPI(title="raftd cloud wrapper", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -129,7 +173,8 @@ async def healthz():
     if not alive:
         return JSONResponse({"ok": False, "raftd": "dead"}, status_code=503)
     try:
-        r = await _client.get("/api/state", headers=_headers(), timeout=5)
+        r = await _client.get("/api/state",
+                              headers={"authorization": f"Bearer {_child_key}"}, timeout=5)
         if r.status_code == 200:
             return {"ok": True, "raftd": "up"}
     except httpx.HTTPError:
@@ -139,21 +184,18 @@ async def healthz():
 
 @app.post("/setup/env")
 async def setup_env(req: Request):
-    if ADMIN_KEY and req.headers.get("authorization") != f"Bearer {ADMIN_KEY}":
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not _authed(req):
+        return JSONResponse({"error": "unauthorized — pass ?key= or Authorization: Bearer"},
+                            status_code=401)
     try:
         body = await req.json()
     except Exception:
         body = {}
     if not isinstance(body, dict):
         body = {}
-    # Merge into the existing file — a partial update must not wipe other keys.
-    existing: dict[str, str] = {}
-    if ENVFILE.exists():
-        for line in ENVFILE.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                existing[k.strip()] = v.strip()
+    # Merge into the existing merged view — a partial update must not wipe
+    # other keys, and keys living only in the legacy file survive.
+    existing = _load_envfile()
     saved = []
     for k in ENV_KEYS:
         v = body.get(k)
@@ -167,53 +209,57 @@ async def setup_env(req: Request):
 
 @app.post("/setup/restart")
 async def setup_restart(req: Request):
-    if ADMIN_KEY and req.headers.get("authorization") != f"Bearer {ADMIN_KEY}":
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not _authed(req):
+        return JSONResponse({"error": "unauthorized — pass ?key= or Authorization: Bearer"},
+                            status_code=401)
     _stop_child()
     ok = await _ensure_up()
     return {"ok": ok, "health": "up" if ok else "starting"}
 
 
-async def _stream(resp):
-    async for chunk in resp.aiter_bytes():
-        yield chunk
+async def _send_upstream(req: Request, path: str) -> httpx.Response | None:
+    """One upstream request with a single respawn+retry on transport failure."""
+    headers = {k: v for k, v in req.headers.items()
+               if k.lower() not in ("host", "content-length", "authorization")}
+    headers["authorization"] = f"Bearer {_child_key}"
+    # Strip the public key param — the child authenticates by Bearer only.
+    params = [(k, v) for k, v in req.query_params.multi_items() if k != "key"]
+    body = await req.body()
+    for attempt in range(2):
+        ureq = _client.build_request(req.method, f"/{path}",
+                                     headers=headers, params=params, content=body)
+        try:
+            return await _client.send(ureq, stream=True)
+        except httpx.HTTPError:
+            # Child died between health and request — respawn once, retry once.
+            if attempt == 0 and _spawn() and await _wait_ready(60):
+                continue
+            return None
+    return None
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, req: Request):
+    # The console page itself is public (it prompts for the key); everything
+    # else — /api/*, any other path — requires the admin key at the edge.
+    if not _authed(req) and not (req.method == "GET" and path in ("", "favicon.ico")):
+        return JSONResponse({"error": "unauthorized — pass ?key= or Authorization: Bearer"},
+                            status_code=401)
     if _child is None or _child.poll() is not None:
         # Respawn on demand — a crashed child shouldn't leave every request 502.
         if not await _ensure_up():
             return JSONResponse({"error": "raftd is starting"}, status_code=503)
-    url = f"/{path}" + (f"?{req.url.query}" if req.url.query else "")
-    headers = dict(req.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
-    # Browser console passes the key as ?key= (EventSource can't set headers) —
-    # the child's API only accepts Bearer, so translate it here.
-    if ADMIN_KEY:
-        headers["authorization"] = f"Bearer {ADMIN_KEY}"
-    elif _child_key:
-        headers["authorization"] = f"Bearer {_child_key}"
-    body = await req.body()
-    try:
-        upstream = await _client.request(req.method, url, headers=headers, content=body, stream=True)
-    except httpx.HTTPError as e:
-        # Child died between health and request — respawn once, retry once.
-        if _spawn() and await _wait_ready(60):
-            try:
-                upstream = await _client.request(req.method, url, headers=headers, content=body, stream=True)
-            except httpx.HTTPError:
-                return JSONResponse({"error": f"raftd unreachable: {e}"}, status_code=502)
-        else:
-            return JSONResponse({"error": f"raftd unreachable: {e}"}, status_code=502)
-    try:
-        async with upstream:
-            return StreamingResponse(
-                _stream(upstream),
-                status_code=upstream.status_code,
-                headers={k: v for k, v in upstream.headers.items()
-                         if k.lower() not in ("transfer-encoding", "content-length", "connection", "content-encoding")},
-            )
-    except httpx.HTTPError as e:
-        return JSONResponse({"error": f"upstream stream failed: {e}"}, status_code=502)
+    upstream = await _send_upstream(req, path)
+    if upstream is None:
+        return JSONResponse({"error": "raftd unreachable"}, status_code=502)
+    # The upstream response must stay open until the stream finishes — aclose
+    # rides on the response background task, not an `async with` (httpx
+    # Response is not an async context manager).
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers={k: v for k, v in upstream.headers.items()
+                 if k.lower() not in ("transfer-encoding", "content-length",
+                                      "connection", "content-encoding")},
+        background=BackgroundTask(upstream.aclose),
+    )

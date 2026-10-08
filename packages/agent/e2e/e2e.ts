@@ -31,6 +31,8 @@ import {
   DurableDaemon,
   MachineLock,
   MachineLockError,
+  processStartTime,
+  AgentsDoc,
   JsonlDeliveryTransport,
   OutboxDoc,
   OutboxError,
@@ -865,6 +867,116 @@ async function phaseM(stateDir: string) {
   check("--host 0.0.0.0 without RAFTD_KEY refused", refCode !== 0 && refCode !== -1 && /refus/i.test(refOut), `code=${refCode} ${refOut.trim().slice(0, 100)}`);
 }
 
+async function phaseN(stateDir: string) {
+  phase("N — issue-#2 round-2 regressions");
+
+  // Stale-lock takeover stress: a dead-owner lock preset each round, 32
+  // concurrent acquires — exactly one winner or the mutex protocol leaked.
+  let multi = 0;
+  let maxWinners = 0;
+  for (let round = 0; round < 40; round++) {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-stale-"));
+    await writeFile(path.join(dir, "raftd.lock"), JSON.stringify({
+      pid: 2147483647, token: "dead-owner", startedAt: "2000-01-01T00:00:00Z",
+    }));
+    const results = await Promise.allSettled([...Array(32)].map(() => MachineLock.acquire(dir)));
+    const won = results.filter((r) => r.status === "fulfilled");
+    maxWinners = Math.max(maxWinners, won.length);
+    if (won.length > 1) multi++;
+    for (const w of won) await (w as PromiseFulfilledResult<MachineLock>).value.release();
+    await rm(dir, { recursive: true, force: true });
+  }
+  check("stale-lock takeover: exactly one winner per round", multi === 0 && maxWinners === 1, `max=${maxWinners} multi=${multi}`);
+
+  // Orphan reaping is ledger-based, not cwd-based: a recorded child is
+  // killed even after cd'ing elsewhere; an unrecorded process sitting in
+  // the workspace is left alone.
+  const ws = path.join(stateDir, "workspaces", "e2e-stray");
+  const elsewhere = await mkdtemp(path.join(tmpdir(), "raftd-e2e-elsewhere-"));
+  await mkdir(ws, { recursive: true });
+  const stray = spawn("sleep", ["120"], { cwd: ws, detached: true, stdio: "ignore" });
+  const orphanInWs = spawn("sleep", ["120"], { cwd: ws, detached: true, stdio: "ignore" });
+  const orphanElsewhere = spawn("sleep", ["120"], { cwd: elsewhere, detached: true, stdio: "ignore" });
+  for (const p of [stray, orphanInWs, orphanElsewhere]) p.unref();
+  await sleep(400);
+  const ledgerFile = path.join(stateDir, "tool-children.jsonl");
+  await writeFile(ledgerFile,
+    [orphanInWs, orphanElsewhere]
+      .map((p) => JSON.stringify({ pid: p.pid, start: processStartTime(p.pid!) }))
+      .join("\n") + "\n");
+  const alive = (pid: number | undefined) => {
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const dOrphan = await DurableDaemon.open({ stateDir, providers: [] });
+  await sleep(300);
+  check("ledger-recorded orphan in workspace reaped", !alive(orphanInWs.pid));
+  check("ledger-recorded orphan outside workspace reaped", !alive(orphanElsewhere.pid));
+  check("unrecorded process in workspace spared", alive(stray.pid));
+  await dOrphan.close();
+  stray.kill("SIGKILL");
+  await rm(elsewhere, { recursive: true, force: true });
+
+  // Legacy upgrade: a record without projectedSubmissions must NOT recount
+  // outcomes the old code already projected (double-count regression).
+  const dLeg = await DurableDaemon.open({ stateDir, providers: [] });
+  const { record: leg } = await dLeg.createAgent({ name: "legacybot", model: MODEL });
+  await dLeg.postMessage(leg.agentId, "hello");
+  const settled = await waitFor("legacy submission settles", async () => {
+    const r = (await dLeg.listAgents()).find((a) => a.agentId === leg.agentId);
+    return (r?.runs ?? 0) + (r?.failures ?? 0) >= 1;
+  }, 60_000, 500);
+  check("legacy submission settled once", settled);
+  // Strip the field — that's what pre-ledger records look like on disk.
+  await dLeg.harness.commit(async (tx) => {
+    const doc = await tx.doc(AgentsDoc);
+    const r = doc.records[leg.agentId];
+    if (r) delete (r as { projectedSubmissions?: string[] }).projectedSubmissions;
+  }, BACKGROUND_CONTEXT);
+  await dLeg.close();
+  const dLeg2 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLeg2.resume();
+  const legAfter = (await dLeg2.listAgents()).find((a) => a.agentId === leg.agentId);
+  check(
+    "legacy upgrade does not double-count outcomes",
+    (legAfter?.runs ?? 0) + (legAfter?.failures ?? 0) === 1,
+    `runs=${legAfter?.runs} failures=${legAfter?.failures}`,
+  );
+  await dLeg2.close();
+
+  // whenBusy=reject on a genuinely running conversation → 409, not 500.
+  const portN = await freePort();
+  const srvN = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portN)], {
+    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let srvNOut = "";
+  srvN.stdout.on("data", (d) => (srvNOut += String(d)));
+  srvN.stderr.on("data", (d) => (srvNOut += String(d)));
+  const upN = await waitFor("reject-test serve up", async () => (await fetch(`http://127.0.0.1:${portN}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  check("reject-test serve up", upN, srvNOut.trim().slice(-100));
+  if (upN) {
+    const mk = await fetch(`http://127.0.0.1:${portN}/api/agents`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "busybot" }),
+    });
+    const { agentId: busyId } = (await mk.json()) as { agentId: string };
+    await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "Run exactly this bash command: sleep 60; echo done. Then reply DONE." }),
+    });
+    const rej = await fetch(`http://127.0.0.1:${portN}/api/agents/${busyId}/messages`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "jump the queue", whenBusy: "reject" }),
+    });
+    check("whenBusy=reject while running → 409", rej.status === 409, `status=${rej.status} ${await rej.text().catch(() => "")}`);
+    srvN.kill("SIGKILL");
+    await waitExit(srvN);
+    await rm(path.join(stateDir, "raftd.port"), { force: true });
+  } else {
+    srvN.kill("SIGKILL");
+  }
+}
+
 async function phaseL(stateDir: string) {
   phase("L — hardening regressions");
 
@@ -955,6 +1067,7 @@ try {
   await phaseK(STATE_DIR);
   await phaseL(STATE_DIR);
   await phaseM(STATE_DIR);
+  await phaseN(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));

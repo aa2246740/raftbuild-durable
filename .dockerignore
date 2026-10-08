@@ -1,0 +1,9 @@
+.git
+node_modules
+**/node_modules
+reference
+deploy/build
+deploy/*.egg-info
+deploy/repo.tar.gz
+*.sqlite
+packages/agent/e2e/report.md

@@ -54,8 +54,10 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 - **联网安全**：`--host` 绑公网地址时**必须**设 `RAFTD_KEY`——不设就拒绝启动
   （`RAFTD_INSECURE=1` 显式放弃鉴权才会放它裸奔）。薄 CLI 读同一个 `RAFTD_KEY` 发 Bearer；
   控制台在 URL 上加 `?key=` 或在页面提示框里输。名字 `main` 保留给操作员收件箱，不可创建。
-- **SIGKILL 时的工具子进程**（诚实说明）：daemon 被 `kill -9` 时，工具正在跑的子进程会成孤儿，
-  环境给不了进程组追踪——重开后事务内续跑是安全的，但那个孤儿可能自行跑完。删掉它：`pkill -f <命令>` 或重启前 `pnpm cli stop <agent>`
+- **SIGKILL 时的工具子进程**（诚实说明）：daemon 被 `kill -9` 时，工具正在跑的子进程会成孤儿。
+  spawn 时会把子进程的 pid+内核启动时间记进 `tool-children.jsonl` 台账，重开时只收割台账里的进程组
+  ——不误伤你在 workspace 里跑的其它程序，进程「cd 走」也逃不掉。台账有天生盲区：spawn 与记账之间的
+  极端窄窗（微秒级）仍会漏网，视为尽力而为而不是硬保证
 
 ## 布局
 
@@ -104,9 +106,20 @@ serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 第三轮加固回归（活提�
 
 ## 上云
 
-`deploy/` 是给 Fly.io 准备的完整包裹：`app/main.py` 是个 FastAPI 反代（起 `raftd serve`、
-`RAFTD_KEY` 鉴权、`POST /setup/env` 持久化模型 key），`Dockerfile` 一个镜像装 Node24+pnpm+全仓库。
-`fly deploy` 或直接 Devin「部署后端」。状态全在 `/data` 卷里，机器回收不丢。
+`deploy/` 是给 Fly.io 准备的完整包裹：`app/main.py` 是个 FastAPI 反代——对外只有 `/healthz` 和
+控制台首页公开，其余一律要 admin key（`Authorization: Bearer` 或 `?key=`）；key 取 `RAFTD_KEY`，
+没设就自动生成并存进 `/data` 卷的 `admin-key` 文件（日志里也会打）。child daemon 用独立的内部 key，
+你的 key 只在外层校验、不进子进程。`POST /setup/env`（同样要 key）持久化 provider key 到
+`/data/.env`；旧版 `/data/raftd/child.env` 的存量配置会自动并进来，升级不丢。
+
+`Dockerfile` 从**仓库根**用当前源码构建（不再打包仓库里的 tar 快照）：
+
+```bash
+docker build -f deploy/Dockerfile -t raftd .    # 在仓库根目录跑
+fly deploy                                     # fly.toml 也在仓库根
+```
+
+状态全在 `/data` 卷里（session.sqlite / workspaces / admin-key / .env），机器回收不丢。
 
 ## 明确不做的
 

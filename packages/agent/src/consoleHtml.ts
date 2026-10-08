@@ -37,6 +37,12 @@ export const CONSOLE_HTML = `<!doctype html>
     #content { flex-direction:column; min-height:0; }
     #feed { width:auto; border-right:none; border-bottom:1px solid var(--line); max-height:30vh; }
     #chat { min-height:0; flex:1; }
+    /* Composer wraps to two rows on phones: message input gets the full
+       width, mode select + Send share the second row — nothing overflows. */
+    #composer { flex-wrap:wrap; }
+    #composer input { order:-1; flex:1 1 100%; }
+    #composer select { flex:1 1 60%; min-width:0; }
+    #composer button { flex:1 1 30%; }
   }
   #chat-head { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
   #chat-head .t { font-weight:600; }
@@ -54,7 +60,7 @@ export const CONSOLE_HTML = `<!doctype html>
   .tc { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--warn); margin-top:5px; }
   .tk { font-size:12px; color:var(--mut); font-style:italic; margin-top:5px; border-left:2px solid var(--line); padding-left:8px; }
   #composer { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
-  #composer input { flex:1; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 12px; font:inherit; }
+  #composer input { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 12px; font:inherit; }
   #composer select, button { background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--fg); padding:9px 14px; font:inherit; cursor:pointer; }
   button.primary { background:var(--acc); border-color:var(--acc); color:#0d1117; font-weight:600; }
   button:hover { filter:brightness(1.15); }

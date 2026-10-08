@@ -7,3 +7,4 @@ dist/
 deploy/build/
 deploy/*.egg-info/
 deploy/repo.tar.gz
+deploy/app/__pycache__/

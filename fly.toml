@@ -1,6 +1,7 @@
 app = "raftd"
 primary_region = "iad"
 [build]
+  dockerfile = "deploy/Dockerfile"
 [[mounts]]
   source = "raftd_data"
   destination = "/data"

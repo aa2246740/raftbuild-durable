@@ -36,7 +36,9 @@ function statusFor(err: unknown): number {
     return 400;
   }
   if (err instanceof OutboxError) return 409; // unreliable/overflow → conflict state
-  if (err instanceof Error && /conversation is busy|cannot parse when|invalid (hour|minute)|repeating reminders/i.test(err.message)) {
+  if (err instanceof Error && /\bis busy\b|cannot parse when|invalid (hour|minute)|repeating reminders/i.test(err.message)) {
+    // "Conversation 2 is busy" carries the id — match the phrase, not the
+    // literal "conversation is busy".
     return /busy/i.test(err.message) ? 409 : 400;
   }
   return 500;

@@ -7,8 +7,8 @@
  * "Daemon" here is a lifetime, not a process: `open()` on an existing state
  * dir IS the restart — unfinished work resumes via `harness.resume()`.
  */
-import { mkdir, appendFile, rm, readdir, readlink, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, appendFile, rm, readdir, readFile } from "node:fs/promises";
+import { appendFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -51,6 +51,7 @@ import {
   type WorkspaceDirectoryInfo,
 } from "./workspaces.ts";
 import { DurableEventNormalizer } from "./events.ts";
+import { processStartTime } from "./machineLock.ts";
 import { AgentOutbox, OutboxDoc, OutboxError } from "./outbox.ts";
 import { JsonlDeliveryTransport, type OutboxTransport } from "./transport.ts";
 import { terminalFailureFromRawText, turnCompletedOutcome } from "./outcome.ts";
@@ -199,7 +200,7 @@ export class DurableDaemon {
     registry.install(RaftAgentExtension);
     registry.install(MessagingExtension);
 
-    const orphans = await reapOrphanedToolChildren(workspacesDir);
+    const orphans = await reapOrphanedToolChildren(stateDir);
     if (orphans > 0) {
       console.error(`[daemon] reaped ${orphans} orphaned tool process(es) left by a previous host (SIGKILL window)`);
     }
@@ -213,7 +214,9 @@ export class DurableDaemon {
         settings: options.settings,
         env: (target) => {
           const cwd = target.cwd ?? workspacesDir;
-          return new NodeExecutionEnv({ cwd });
+          const env = new NodeExecutionEnv({ cwd });
+          trackToolChildren(env, stateDir);
+          return env;
         },
       },
       BACKGROUND_CONTEXT,
@@ -1067,42 +1070,53 @@ export class DurableDaemon {
    * was closed between place and settle) — produce any missing outcome frame.
    */
   private async reconcileSubmissions(record: AgentRecord): Promise<void> {
-    let cursor;
-    for (;;) {
-      const page = await this.storage.scanSubmissions(
-        { conversationId: Number(record.conversationId) as ConversationId, status: "done" },
-        100,
-        cursor,
-        BACKGROUND_CONTEXT,
-      );
-      for (const rec of page.items) {
-        await this.produceOutcome(record.agentId, {
-          kind: "submission_settled",
-          submissionId: String(rec.id),
-          status: "done",
-        });
+    const settled: { id: string; status: "done" | "unanswered"; reason?: string }[] = [];
+    for (const status of ["done", "unanswered"] as const) {
+      let cursor;
+      for (;;) {
+        const page = await this.storage.scanSubmissions(
+          { conversationId: Number(record.conversationId) as ConversationId, status },
+          100,
+          cursor,
+          BACKGROUND_CONTEXT,
+        );
+        for (const rec of page.items) {
+          settled.push({
+            id: String(rec.id),
+            status,
+            reason: status === "unanswered" ? rec.reason : undefined,
+          });
+        }
+        if (page.next === undefined) break;
+        cursor = page.next;
       }
-      if (page.next === undefined) break;
-      cursor = page.next;
     }
-    cursor = undefined;
-    for (;;) {
-      const page = await this.storage.scanSubmissions(
-        { conversationId: Number(record.conversationId) as ConversationId, status: "unanswered" },
-        100,
-        cursor,
-        BACKGROUND_CONTEXT,
-      );
-      for (const rec of page.items) {
-        await this.produceOutcome(record.agentId, {
-          kind: "submission_settled",
-          submissionId: String(rec.id),
-          status: "unanswered",
-          reason: rec.status === "unanswered" ? rec.reason : undefined,
-        });
-      }
-      if (page.next === undefined) break;
-      cursor = page.next;
+    // Legacy migration: records written before the projection ledger have no
+    // projectedSubmissions field, and their outcomes were ALREADY counted
+    // (runs/failures/lastOutcome) by the old produce path. Blindly replaying
+    // them through the repair path would double-count every upgrade. Seed
+    // the ledger with all settled ids up front — a submission whose frame
+    // was never committed still repairs via outbox dedupe, only the
+    // counter-skip is a conscious trade-off (documented in NOTES).
+    if (record.projectedSubmissions === undefined && settled.length > 0) {
+      const ids = settled.map((s) => s.id);
+      await this.harness
+        .commit(async (tx: Tx) => {
+          const doc = await tx.doc(AgentsDoc);
+          const r = doc.records[record.agentId];
+          if (r && r.projectedSubmissions === undefined) {
+            r.projectedSubmissions = ids.slice(-4096);
+          }
+        }, BACKGROUND_CONTEXT)
+        .catch(() => {});
+    }
+    for (const s of settled) {
+      await this.produceOutcome(record.agentId, {
+        kind: "submission_settled",
+        submissionId: s.id,
+        status: s.status,
+        reason: s.reason,
+      });
     }
   }
 }
@@ -1147,53 +1161,84 @@ function pickDefaultModel(providers: readonly Provider[]): AgentModelRef | undef
 }
 
 /**
- * Orphan reaper for the host-SIGKILL window: tool children run detached in
- * their own process group under the agent's workspace, so when the host dies
- * mid-tool they survive as orphans that can duplicate side effects while the
- * durable run re-executes. On open, scan /proc for processes whose cwd is
- * inside workspaces/ and SIGKILL their whole process group. POSIX only,
- * best-effort — on non-Linux or restricted /proc this is a no-op.
+ * Orphaned tool children, tracked by LEDGER not by cwd.
+ *
+ * Tool subprocesses spawn detached (each is its own process-group leader,
+ * pgid === pid), so a host SIGKILL orphans them mid-side-effect while the
+ * durable run re-executes. Attributing orphans by "cwd under workspaces/"
+ * is wrong in both directions: it kills unrelated processes the user is
+ * running inside a workspace (editors, debugging), and it misses a real
+ * tool child that `cd`'d out of the workspace before the host died.
+ *
+ * Instead every spawn is recorded at birth in stateDir/tool-children.jsonl
+ * (pid + kernel starttime — the pid-reuse guard), and open() SIGKILLs the
+ * process groups of exactly those recorded pids that are still alive.
+ * Best-effort: a spawn torn down between exec() and the ledger write can
+ * still escape; a pid reused for a different process never matches because
+ * starttime differs.
  */
-async function reapOrphanedToolChildren(workspacesDir: string): Promise<number> {
-  const proc = "/proc";
-  const root = path.resolve(workspacesDir);
-  let reaped = 0;
-  let ents: string[];
-  try {
-    ents = await readdir(proc);
-  } catch {
-    return 0;
-  }
-  // Own process group id (never kill ourselves even if we run inside workspaces/).
-  let ownPgid = -1;
-  try {
-    const self = await readFile("/proc/self/stat", "utf8");
-    ownPgid = Number(self.slice(self.lastIndexOf(")") + 2).split(" ")[2]);
-  } catch {
-    /* best-effort */
-  }
-  for (const pid of ents) {
-    if (!/^\d+$/.test(pid)) continue;
+const TOOL_CHILDREN_FILE = "tool-children.jsonl";
+
+function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void {
+  // NodeExecutionEnv keeps a private Set<number> of live child pids, added
+  // the moment spawn() returns — wrap add() so every spawn is journaled
+  // (sync append; spawn bookkeeping cannot await).
+  const holder = env as unknown as { activeChildPids?: unknown };
+  const pids = holder.activeChildPids;
+  if (!(pids instanceof Set)) return;
+  const file = path.join(stateDir, TOOL_CHILDREN_FILE);
+  const origAdd = pids.add.bind(pids);
+  pids.add = (pid: number): Set<number> => {
     try {
-      const cwd = await readlink(path.join(proc, pid, "cwd"));
-      if (!cwd.startsWith(root + path.sep)) continue;
-      // After the last ')' of /proc/<pid>/stat the fields are
-      // `state ppid pgrp …` — pgrp is index 2.
-      const stat = await readFile(path.join(proc, pid, "stat"), "utf8");
-      const afterComm = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const pgid = Number(afterComm[2]);
-      if (Number.isInteger(pgid) && pgid > 0 && pgid !== ownPgid) {
-        try {
-          process.kill(-pgid, "SIGKILL");
-          reaped++;
-        } catch {
-          /* group gone */
-        }
-      }
+      appendFileSync(file, JSON.stringify({ pid, start: processStartTime(pid) }) + "\n");
     } catch {
-      /* process exited or no permission */
+      /* ledger is best-effort */
+    }
+    return origAdd(pid);
+  };
+}
+
+async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
+  const file = path.join(stateDir, TOOL_CHILDREN_FILE);
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch {
+    return 0; // no ledger → nothing this daemon's lineage ever spawned
+  }
+  let reaped = 0;
+  const seen = new Set<number>();
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let pid: number | undefined;
+    let start: string | undefined;
+    try {
+      const e = JSON.parse(line) as { pid?: number; start?: string };
+      pid = e.pid;
+      start = e.start;
+    } catch {
+      continue;
+    }
+    if (typeof pid !== "number" || pid <= 1 || pid === process.pid || seen.has(pid)) continue;
+    seen.add(pid);
+    // Alive check + pid-reuse check in one: the recorded kernel starttime
+    // must match the process currently owning this pid.
+    const now = processStartTime(pid);
+    if (now === undefined || (start !== undefined && now !== start)) continue;
+    try {
+      process.kill(-pid, "SIGKILL"); // detached child = process-group leader
+      reaped++;
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+        reaped++;
+      } catch {
+        /* gone */
+      }
     }
   }
+  // The ledger describes the previous lifetime — consumed once reaped.
+  await rm(file, { force: true });
   return reaped;
 }
 

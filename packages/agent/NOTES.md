@@ -126,3 +126,18 @@ GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/1
 | 控制台发送失败清输入 | 成功才清空；错误横幅提示；390px 窄屏纵向布局 |
 | IPv6 `--host ::1` | URL/端口文件都带 `[]` |
 | 云包装层 | 认证化就绪探测、`?key=`→Bearer 注入、child 死后按需重生+503 healthz、SIGTERM 收 child、`/setup/env` 全 provider+merge 不重写 |
+
+## issue #2 二轮复测修复（PR #3 追加）
+
+| 发现 | 修法 |
+|---|---|
+| stale-lock 接管仍在 inspect→replace 窗口竞态 | 换协议：`<lock>.takeover/` mkdir 原子互斥，临界区内重新 inspect（inode 变化=让位），删锁改 unlink，link() 仍是唯一创建通道。32并发×60轮实测单持有者 |
+| 孤儿清理误杀/漏杀（cwd 归属） | 台账制：`activeChildPids.add` 挂钩在 spawn 时记 {pid,内核starttime} 到 `tool-children.jsonl`；open() 只杀台账中 starttime 匹配的存活 pid（整组 SIGKILL）。不杀陌生人的进程，也不怕工具 cd 走 |
+| 升级旧状态 outcome 重复计数 | legacy 迁移：`projectedSubmissions === undefined` 的 record，reconcile 先把全部 settled submission id 播种进台账再跑修复循环（不重新计数；frame 未提交者仍经 outbox dedupe 补投） |
+| whenBusy=reject 返回 500 | statusFor 正则放宽 `\bis busy\b`（"Conversation 2 is busy" 带 id 不再漏）→409 |
+| 390px 输入栏溢出 | composer `flex-wrap` + input `order:-1 flex:1 1 100%`，窄屏两行排列 |
+| wrapper 代理全 500 | httpx 0.28 没有 `request(stream=)` → `build_request`+`send(stream=True)`；响应生命周期交给 `StreamingResponse(background=BackgroundTask(aclose))`，去掉非法 `async with` |
+| wrapper 公网无鉴权 | 外部 Bearer/`?key=` 先验 admin key 才放行 /api/*、`/setup/*`；admin key=RAFTD_KEY 或持久化 `STATE/admin-key`（自动生成+写日志）；child 用独立内部 key，调用者凭据不转发 |
+| SIGTERM 杀 child 但父不退 | 删自定义 signal handler，child 清理挪进 FastAPI lifespan shutdown，uvicorn 退出链路完整 |
+| Docker 打包过期 daemon | 删 tracked `repo.tar.gz`；Dockerfile 改从仓库根 COPY 当前源码构建；fly.toml 移到根 + `dockerfile=deploy/Dockerfile`；加 `.dockerignore` |
+| wrapper 升级丢旧配置/query-key | `_load_envfile()` 合并 `STATE/child.env`→`DATA/.env`（旧 key 保留）；setup 端点恢复接受 `?key=` |

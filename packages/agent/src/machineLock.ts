@@ -10,8 +10,8 @@
  *   (pid reuse after reboot) → stale lock, take over;
  * - acquire is an atomic create (O_EXCL) — two racing serves cannot both win.
  */
-import { readFileSync } from "node:fs";
-import { link, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
+import { link, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -27,7 +27,7 @@ export class MachineLockError extends Error {
 type LockOwner = { pid: number; token: string; startedAt: string; pidStart?: string };
 
 /** /proc/<pid>/stat field 22 — kernel starttime, survives nothing but the pid itself. */
-function processStartTime(pid: number): string | undefined {
+export function processStartTime(pid: number): string | undefined {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // comm may contain spaces/parens — parse after the last ')'.
@@ -57,14 +57,47 @@ function ownerAlive(owner: LockOwner): boolean {
 }
 
 /** Read the lock; null = absent/unreadable, owner.alive reports pid state. */
-export function inspectLock(stateDir: string): { owner: LockOwner; alive: boolean } | null {
+export function inspectLock(stateDir: string): { owner: LockOwner; alive: boolean; ino?: number } | null {
   const file = path.join(stateDir, LOCK_NAME);
   try {
+    const ino = statSync(file).ino;
     const owner = JSON.parse(readFileSync(file, "utf8")) as LockOwner;
     if (typeof owner.pid !== "number") return null;
-    return { owner, alive: ownerAlive(owner) };
+    return { owner, alive: ownerAlive(owner), ino };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Serializes stale-lock takeover. A stale lock must be removed before a fresh
+ * link() can land, and inspect→remove is a check-then-act window: without a
+ * mutex two racers can each delete the other's just-created live lock. mkdir()
+ * is atomic on POSIX, so `<lock>.takeover/` is the mutex. Holders finish in
+ * microseconds; a dir older than 30s belongs to a crashed holder and is
+ * force-reaped. Returns false when the mutex stayed contended — callers retry.
+ */
+async function withTakeoverMutex<T>(dir: string, fn: () => Promise<T>): Promise<T | undefined> {
+  for (let i = 0; i < 200; i++) {
+    try {
+      await mkdir(dir);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      const st = await stat(dir).catch(() => null);
+      if (st === null) continue;
+      if (Date.now() - st.mtimeMs > 30_000) {
+        await rm(dir, { recursive: true, force: true });
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+      if (i === 199) return undefined;
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
@@ -107,16 +140,20 @@ export class MachineLock {
           `state dir already locked by pid ${existing.owner.pid} (started ${existing.owner.startedAt})`,
         );
       }
-      // Dead owner or debris → take over ATOMICALLY: rename() claims the
-      // slot, so two racing takeovers cannot both unlink a live successor's
-      // lock (rename fails ENOENT for the loser, who then retries link).
-      const stalePath = `${file}.stale-${token}`;
-      try {
-        await rename(file, stalePath);
-        await rm(stalePath, { force: true });
-      } catch {
-        // ENOENT → another racer claimed/recreated it; retry the link.
-      }
+      // Dead owner or debris → remove it, but only under the takeover mutex
+      // and only after a FRESH re-inspection inside the critical section:
+      // the file we looked at may have been rotated into a live lock while
+      // we waited. Deletion is unlink-not-rename — afterwards the plain
+      // link() create decides the winner atomically.
+      await withTakeoverMutex(`${file}.takeover`, async () => {
+        const st = await stat(file).catch(() => null);
+        if (st === null) return; // already gone — just retry the link
+        if (existing !== null && existing.ino !== undefined && st.ino !== existing.ino) {
+          return; // rotated since we looked — next iteration re-inspects
+        }
+        if (inspectLock(stateDir)?.alive) return; // live owner now — hands off
+        await rm(file, { force: true });
+      });
     }
     throw new MachineLockError(`could not acquire ${file} after 8 attempts (contention)`);
   }
