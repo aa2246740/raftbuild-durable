@@ -265,9 +265,11 @@ async def _ensure_up() -> bool:
         # A restart replaces/cancels the old generation. Its existing proxy
         # waiters follow the replacement; cancelling the request itself
         # still propagates normally and never cancels shared startup.
-        if asyncio.current_task().cancelling():
-            raise
-        return await _ensure_up()
+        # task.cancelled() tells the shared bring-up's cancellation apart
+        # from this waiter's own cancellation (Task.cancelling() needs 3.11+).
+        if task.cancelled():
+            return await _ensure_up()
+        raise
 
 
 async def _restart_and_bring_up(previous: "asyncio.Task[bool] | None") -> bool:
