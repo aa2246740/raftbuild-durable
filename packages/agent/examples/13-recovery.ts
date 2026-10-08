@@ -1,6 +1,6 @@
 // Close, reopen, and continue where a task stopped.
 // Run from packages/durable:
-//   node --conditions=source --experimental-strip-types test/examples/13-recovery.ts
+//   node --conditions=source test/examples/13-recovery.ts
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

@@ -8,7 +8,7 @@ import sys
 
 node, holder, state = sys.argv[1:]
 child = subprocess.Popen(
-    [node, '--experimental-transform-types', holder, state],
+    [node, holder, state],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     text=True,
 )

@@ -13,16 +13,24 @@ import type { DurableDaemon } from "./daemon.ts";
 import { AgentRegistryError } from "./agents.ts";
 import { OutboxError } from "./outbox.ts";
 import { CONSOLE_HTML } from "./consoleHtml.ts";
+import { resolveApiKey, validBearer } from "./auth.ts";
 
 export interface ServeOptions {
   host?: string;
   port?: number;
+  /** Additional DNS aliases on this HTTP listener's own port. */
+  allowedHosts?: string[];
 }
+
+export type RaftServer = Server & { consoleUrl: string };
 
 /** Carries an HTTP status through the catch-all error mapper. */
 class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
     super(message);
+    this.status = status;
     this.name = "HttpError";
   }
 }
@@ -30,13 +38,14 @@ class HttpError extends Error {
 /** Map thrown domain errors to HTTP statuses instead of blanket 500s. */
 function statusFor(err: unknown): number {
   if (err instanceof HttpError) return err.status;
+  if (err instanceof URIError) return 400;
   if (err instanceof AgentRegistryError) {
-    if (err.code === "name_taken") return 409;
+    if (err.code === "name_taken" || err.code === "conflict") return 409;
     if (err.code === "not_found") return 404;
     return 400;
   }
   if (err instanceof OutboxError) return 409; // unreliable/overflow → conflict state
-  if (err instanceof Error && /\bis busy\b|cannot parse when|invalid (hour|minute)|repeating reminders/i.test(err.message)) {
+  if (err instanceof Error && /\bis busy\b|cannot parse when|invalid (hour|minute)|repeating reminders|reminder time must be in the future/i.test(err.message)) {
     // "Conversation 2 is busy" carries the id — match the phrase, not the
     // literal "conversation is busy".
     return /busy/i.test(err.message) ? 409 : 400;
@@ -52,7 +61,18 @@ function json(res: ServerResponse, code: number, body: unknown): void {
 
 async function readBody(req: HttpRequest): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  const limit = 1024 * 1024;
+  if (Number(req.headers["content-length"]) > limit) throw new HttpError(413, "request body exceeds 1 MiB");
+  let size = 0;
+  for await (const c of req.iterator({ destroyOnReturn: false })) {
+    const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+    size += chunk.length;
+    if (size > limit) throw new HttpError(413, "request body exceeds 1 MiB");
+    if (size && req.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+      throw new HttpError(415, "non-empty request body requires Content-Type: application/json");
+    }
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw) return {};
   let parsed: unknown;
@@ -78,6 +98,45 @@ function optString(v: unknown, field: string): string | undefined {
   return v;
 }
 
+function modelField(value: unknown): { provider: string; modelId: string } | undefined {
+  if (value === undefined) return undefined;
+  const spec = reqString(value, "model").trim();
+  const slash = spec.indexOf("/");
+  if (slash <= 0 || slash === spec.length - 1) throw new HttpError(400, "model must be provider/model-id");
+  return { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) };
+}
+
+function thinkingField(value: unknown): "minimal" | "low" | "medium" | "high" | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !["minimal", "low", "medium", "high"].includes(value)) {
+    throw new HttpError(400, "thinking must be minimal|low|medium|high");
+  }
+  return value as "minimal" | "low" | "medium" | "high";
+}
+
+function hostname(value: string): string {
+  return value.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function validateRequestOrigin(req: HttpRequest, host: string, port: number, allowedHosts: string[]): void {
+  const authority = req.headers.host;
+  if (!authority || /[\s\\/@?#]/.test(authority)) throw new HttpError(403, "invalid Host");
+  let incoming: URL;
+  try { incoming = new URL(`http://${authority}`); }
+  catch { throw new HttpError(403, "invalid Host"); }
+  const accepted = new Set([host, "127.0.0.1", "localhost", "::1", ...allowedHosts].map(hostname));
+  // A wildcard bind is not permission for arbitrary DNS names. Accept its
+  // concrete interface address; operators can explicitly allow a public name.
+  if (host === "0.0.0.0" || host === "::") {
+    if (req.socket.localAddress) accepted.add(hostname(req.socket.localAddress.replace(/^::ffff:/, "")));
+  }
+  if (!accepted.has(hostname(incoming.hostname)) || Number(incoming.port || 80) !== port) {
+    throw new HttpError(403, "Host is not allowed");
+  }
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== incoming.origin) throw new HttpError(403, "cross-origin request is not allowed");
+}
+
 /** Read the last `n` parsed events of an agent's transcript JSONL. */
 async function transcriptTail(file: string, n: number): Promise<unknown[]> {
   if (!existsSync(file)) return [];
@@ -95,24 +154,25 @@ async function transcriptTail(file: string, n: number): Promise<unknown[]> {
     });
 }
 
-export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}): Promise<Server> {
+export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}): Promise<RaftServer> {
   const host = opts.host ?? "127.0.0.1";
   const port = opts.port ?? 4777;
   const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
-  // RAFTD_KEY gates every /api/* call (the console stores it in localStorage).
-  const apiKey = String(process.env.RAFTD_KEY ?? "").trim() || undefined;
+  const configuredKey = String(process.env.RAFTD_KEY ?? "").trim() || undefined;
   const wrapperInstance = process.env.RAFTD_WRAPPER_INSTANCE;
   // A public listener without an admin key hands strangers the ability to
   // create agents and run tool calls — refuse unless explicitly opted out.
-  if (!loopback && !apiKey && process.env.RAFTD_INSECURE !== "1") {
+  if (!loopback && !configuredKey && process.env.RAFTD_INSECURE !== "1") {
     throw new Error(
       `refusing to bind ${host}: RAFTD_KEY is not set. Set RAFTD_KEY=<key> (clients send Bearer <key>), ` +
         `bind 127.0.0.1, or set RAFTD_INSECURE=1 to run unauthenticated on purpose.`,
     );
   }
-  if (!loopback && !apiKey) {
+  if (!loopback && !configuredKey) {
     console.error(`warning: RAFTD_INSECURE=1 — ${host} listener is unauthenticated; anyone on the network controls agents.`);
   }
+  const apiKey = await resolveApiKey(daemon.stateDir);
+  const allowedHosts = opts.allowedHosts ?? (process.env.RAFTD_ALLOWED_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
   // Bracket IPv6 literals — `http://::1:4777` is not a valid base URL.
   const base = host.includes(":") ? `http://[${host}]:${port}` : `http://${host}:${port}`;
@@ -121,11 +181,13 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
     // strips the header at its public edge. Never echo a request value here.
     if (wrapperInstance) res.setHeader("x-raftd-instance", wrapperInstance);
     try {
+      const address = server.address();
+      validateRequestOrigin(req, host, typeof address === "object" && address ? address.port : port, allowedHosts);
       const url = new URL(req.url ?? "/", base);
       const parts = url.pathname.split("/").filter(Boolean);
       // ── console ──
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "referrer-policy": "no-referrer", "cache-control": "no-store" });
         res.end(CONSOLE_HTML);
         return;
       }
@@ -135,13 +197,18 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
         return;
       }
 
-      if (apiKey && req.headers.authorization !== `Bearer ${apiKey}`) {
-        json(res, 401, { error: "unauthorized: send Authorization: Bearer $RAFTD_KEY" });
+      if (apiKey && !validBearer(req.headers.authorization, apiKey)) {
+        json(res, 401, { error: "unauthorized: use the console URL printed by raftd serve or send your bearer token" });
         return;
       }
+      const requestBody = ["POST", "PATCH", "PUT", "DELETE"].includes(req.method ?? "") ? await readBody(req) : {};
 
       if (req.method === "GET" && parts[1] === "inspect") {
         json(res, 200, await daemon.inspect());
+        return;
+      }
+      if (req.method === "GET" && parts[1] === "usage" && parts.length === 2) {
+        json(res, 200, await daemon.usage(url.searchParams.get("agent") ?? undefined));
         return;
       }
 
@@ -164,32 +231,48 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
 
       if (parts[1] === "agents") {
         if (req.method === "POST" && parts.length === 2) {
-          const body = (await readBody(req)) as {
+          const body = requestBody as {
             name?: unknown; instructions?: unknown; model?: unknown;
             workspace?: unknown; thinking?: unknown;
           };
           const name = reqString(body.name, "name");
           const instructions = optString(body.instructions, "instructions");
           const workspace = optString(body.workspace, "workspace");
-          const thinking = optString(body.thinking, "thinking");
-          const modelSpec = optString(body.model, "model");
-          const model = modelSpec
-            ? { provider: modelSpec.split("/")[0] ?? "", modelId: modelSpec.split("/").slice(1).join("/") }
-            : undefined;
+          const thinking = thinkingField(body.thinking);
+          const model = modelField(body.model);
           const created = await daemon.createAgent({
             name,
             instructions,
             workspace,
-            thinkingLevel: thinking as "minimal" | "low" | "medium" | "high" | undefined,
-            ...(model?.modelId ? { model } : {}),
+            thinkingLevel: thinking,
+            ...(model ? { model } : {}),
           });
           json(res, 201, created.record);
           return;
         }
         if (parts.length >= 3) {
           const id = decodeURIComponent(parts[2]);
+          if (req.method === "PATCH" && parts.length === 3) {
+            const body = requestBody as { name?: unknown; instructions?: unknown; model?: unknown; thinking?: unknown };
+            if (Object.keys(body).some((field) => !["name", "instructions", "model", "thinking"].includes(field))) {
+              throw new HttpError(400, "unsupported agent update field");
+            }
+            const change = {
+              ...(body.name !== undefined ? { name: reqString(body.name, "name") } : {}),
+              ...(body.instructions !== undefined ? { instructions: body.instructions === null ? null : optString(body.instructions, "instructions") } : {}),
+              ...(body.model !== undefined ? { model: modelField(body.model) } : {}),
+              ...(body.thinking !== undefined ? { thinkingLevel: body.thinking === null ? null : thinkingField(body.thinking) } : {}),
+            };
+            if (!Object.keys(change).length) throw new HttpError(400, "provide name, instructions, model, or thinking to update");
+            json(res, 200, await daemon.updateAgent(id, change));
+            return;
+          }
+          if (req.method === "GET" && parts[3] === "usage" && parts.length === 4) {
+            json(res, 200, await daemon.usage(id));
+            return;
+          }
           if (req.method === "POST" && parts[3] === "messages") {
-            const body = (await readBody(req)) as {
+            const body = requestBody as {
               text?: string;
               whenBusy?: "steer" | "followUp" | "reject";
               requestId?: string;
@@ -201,6 +284,9 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
             }
             if (body.requestId !== undefined && typeof body.requestId !== "string") {
               return json(res, 400, { error: "requestId must be a string" });
+            }
+            if (body.raw !== undefined && typeof body.raw !== "boolean") {
+              return json(res, 400, { error: "raw must be a boolean" });
             }
             const r = await daemon.postMessage(id, text, {
               whenBusy: body.whenBusy,
@@ -239,11 +325,17 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
             }
             // Server-side ceiling below the thin-CLI's 120s fetch timeout so a
             // hung answer resolves as a real 504 instead of an aborted socket.
-            const timeoutMs = Math.min(Math.max(Number(url.searchParams.get("timeout") ?? "110"), 1), 300) * 1000;
-            const answer = await Promise.race([
-              daemon.waitForAnswer(sid),
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
-            ]);
+            const requestedTimeout = Number(url.searchParams.get("timeout") ?? "110");
+            if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) throw new HttpError(400, "timeout must be a positive number of seconds");
+            const timeoutMs = Math.min(requestedTimeout, 300) * 1000;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let answer;
+            try {
+              answer = await Promise.race([
+                daemon.waitForAnswer(sid),
+                new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+              ]);
+            } finally { clearTimeout(timer); }
             if (answer === null) {
               return json(res, 504, { error: `submission ${sid} still running after ${timeoutMs / 1000}s` });
             }
@@ -262,14 +354,17 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
             return;
           }
           if (req.method === "POST" && ["stop", "start", "resolve", "abort", "compact", "reset"].includes(parts[3])) {
-            const body = (await readBody(req).catch(() => ({}))) as { note?: string; instructions?: string; handoff?: string };
+            const body = requestBody as { note?: unknown; instructions?: unknown; handoff?: unknown };
+            const note = optString(body.note, "note");
+            const instructions = optString(body.instructions, "instructions");
+            const handoff = optString(body.handoff, "handoff");
             if (parts[3] === "stop") await daemon.stopAgent(id);
             else if (parts[3] === "start") await daemon.startAgent(id);
-            else if (parts[3] === "resolve") await daemon.resolveAgent(id, body.note);
+            else if (parts[3] === "resolve") await daemon.resolveAgent(id, note);
             else if (parts[3] === "abort") await daemon.abort(id);
-            else if (parts[3] === "compact") await daemon.compact(id, body.instructions);
-            else await daemon.reset(id, body.handoff);
-            json(res, 200, { ok: true });
+            else if (parts[3] === "compact") await daemon.compact(id, instructions);
+            else await daemon.reset(id, handoff);
+            json(res, 200, { ok: true, lifecycle: await daemon.lifecycle(id) });
             return;
           }
           if (req.method === "DELETE" && parts.length === 3) {
@@ -294,7 +389,7 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
 
       if (parts[1] === "reminders") {
         if (req.method === "POST" && parts.length === 2) {
-          const body = (await readBody(req)) as { agent?: unknown; when?: unknown; text?: unknown };
+          const body = requestBody as { agent?: unknown; when?: unknown; text?: unknown };
           json(
             res,
             201,
@@ -311,9 +406,12 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
 
       json(res, 404, { error: "not found" });
     } catch (err) {
-      json(res, statusFor(err), { error: err instanceof Error ? err.message : String(err) });
+      const status = statusFor(err);
+      if (status >= 500) console.error("raftd HTTP request failed", err);
+      if (status === 413 || status === 415) res.setHeader("connection", "close");
+      json(res, status, { error: status >= 500 ? "internal server error" : err instanceof URIError ? "invalid URL encoding" : err instanceof Error ? err.message : String(err) });
     }
-  });
+  }) as RaftServer;
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -324,7 +422,13 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   // A managed child must never publish its internal port as public CLI
   // discovery, even briefly during boot or after a wrapper restart.
   const portFile = path.join(daemon.stateDir, wrapperInstance ? "raftd.internal-port" : "raftd.port");
-  await writeFile(portFile, host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`, "utf8");
+  const address = server.address();
+  const actualPort = typeof address === "object" && address ? address.port : port;
+  const clientHost = host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host;
+  const authority = clientHost.includes(":") ? `[${clientHost}]:${actualPort}` : `${clientHost}:${actualPort}`;
+  server.consoleUrl = `http://${authority}/${apiKey ? `#key=${encodeURIComponent(apiKey)}` : ""}`;
+  try { await writeFile(portFile, authority, "utf8"); }
+  catch (err) { server.close(); throw err; }
   server.once("close", () => void rm(portFile, { force: true }).catch(() => {}));
   return server;
 }

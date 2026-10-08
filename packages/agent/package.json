@@ -8,11 +8,11 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:reliability": "node --experimental-transform-types --test test/*.test.mjs",
-    "cli": "node --experimental-transform-types src/cli.ts",
-    "e2e": "node --experimental-transform-types e2e/e2e.ts",
-    "example:recovery": "node --experimental-strip-types examples/13-recovery.ts",
-    "raftd": "node --experimental-transform-types src/cli.ts"
+    "test:reliability": "node --test test/*.test.mjs",
+    "cli": "node src/cli.ts",
+    "e2e": "node e2e/e2e.ts",
+    "example:recovery": "node examples/13-recovery.ts",
+    "raftd": "node src/cli.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.4",

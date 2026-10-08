@@ -104,14 +104,23 @@ function closeDatabases(storage?: DatabaseSync, manager?: DatabaseSync): void {
 }
 
 export class MachineLock {
+  private readonly file: string;
+  private readonly token: string;
+  private readonly database: DatabaseSync;
+  private readonly manager: DatabaseSync | undefined;
   private releasePromise: Promise<void> | undefined;
 
   private constructor(
-    private readonly file: string,
-    private readonly token: string,
-    private readonly database: DatabaseSync,
-    private readonly manager: DatabaseSync | undefined,
-  ) {}
+    file: string,
+    token: string,
+    database: DatabaseSync,
+    manager: DatabaseSync | undefined,
+  ) {
+    this.file = file;
+    this.token = token;
+    this.database = database;
+    this.manager = manager;
+  }
 
   static async acquire(stateDir: string, options: { managedByWrapper?: boolean } = {}): Promise<MachineLock> {
     const dir = path.resolve(stateDir);

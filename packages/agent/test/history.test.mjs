@@ -117,6 +117,7 @@ test('frame-only legacy crash repairs projection exactly once, then new outcomes
   await d.resume();
   assert.equal((await d.listAgents())[0].failures, 1);
   assert.equal(transport.sent.filter((e) => e.frame.type === 'agent:runtime:outcome').length, 0);
+  await d.startAgent(f.agentId); // Explicitly clear the recovered terminal result before retrying.
   const { submissionId } = await d.postMessage(f.agentId, 'real no-model admission');
   await d.waitForAnswer(submissionId);
   await until(async () => (await d.listAgents())[0].failures === 2 && !(await d.outboxState(f.agentId)).entries.length);

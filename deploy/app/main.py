@@ -4,8 +4,8 @@ Security model:
 - The PUBLIC edge is this wrapper. Every route except /healthz and the
   console page (GET /) requires the admin key — `Authorization: Bearer` or
   `?key=` (the web console passes the key as a query param).
-- The admin key is $RAFTD_KEY, else a generated key persisted at
-  $RAFTD_STATE/admin-key (printed to logs on first boot).
+- The admin key is $RAFTD_KEY, else a generated key persisted with mode 0600 at
+  $RAFTD_STATE/admin-key. Secrets are never printed to logs.
 - The child daemon always runs with its own internal RAFTD_KEY; the wrapper
   strips whatever the caller sent and injects it — caller credentials are
   verified HERE, never forwarded.
@@ -24,9 +24,11 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -48,6 +50,7 @@ ENV_KEYS = (
     "zhipu",
     "ZAI_API_KEY",
     "MINIMAX_CN_API_KEY",
+    "MINIMAX_CN",
     "MINIMAX_API_KEY",
     "DEEPSEEK_API_KEY",
     "OPENAI_API_KEY",
@@ -64,21 +67,46 @@ _closing = False
 _restart_lock = asyncio.Lock()
 
 
+def _write_private(file: Path, value: str) -> None:
+    """Publish complete secret/config files atomically, even over old 0644 files."""
+    file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{file.name}.", dir=file.parent)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, file)
+        directory = os.open(file.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _load_admin_key() -> str:
     """Public-edge key: env wins, else a generated key persisted on the volume."""
     env = os.environ.get("RAFTD_KEY", "").strip()
     if env:
+        if ADMIN_KEY_FILE.exists():
+            ADMIN_KEY_FILE.chmod(0o600)
         return env
     try:
         k = ADMIN_KEY_FILE.read_text().strip()
-        if k:
-            return k
-    except OSError:
-        pass
+    except FileNotFoundError:
+        k = ""
+    if k:
+        _write_private(ADMIN_KEY_FILE, k)
+        return k
     k = secrets.token_hex(16)
-    ADMIN_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ADMIN_KEY_FILE.write_text(k)
-    print(f"[raftd-wrapper] admin key: {k} (persisted at {ADMIN_KEY_FILE})", flush=True)
+    _write_private(ADMIN_KEY_FILE, k)
+    print(f"[raftd-wrapper] admin key persisted at {ADMIN_KEY_FILE}", flush=True)
     return k
 
 
@@ -139,9 +167,10 @@ def _claim_wrapper() -> sqlite3.Connection:
 
 def _authed(req: Request) -> bool:
     """Caller must prove the PUBLIC key — Bearer header or ?key= query param."""
-    if req.headers.get("authorization") == f"Bearer {ADMIN_KEY}":
+    header = req.headers.get("authorization", "")
+    if header.startswith("Bearer ") and secrets.compare_digest(header[7:].encode(), ADMIN_KEY.encode()):
         return True
-    return req.query_params.get("key") == ADMIN_KEY
+    return secrets.compare_digest(req.query_params.get("key", "").encode(), ADMIN_KEY.encode())
 
 
 def _load_envfile() -> dict[str, str]:
@@ -152,10 +181,17 @@ def _load_envfile() -> dict[str, str]:
             lines = f.read_text().splitlines()
         except OSError:
             continue
+        # Upgrade the permissions of old plaintext configuration too, not
+        # only files written through the new setup endpoint.
+        f.chmod(0o600)
         for line in lines:
             if "=" in line and not line.startswith("#"):
                 k, _, v = line.partition("=")
-                merged[k.strip()] = v.strip()
+                k, v = k.strip(), v.strip()
+                # Persisted configuration is provider data, never arbitrary
+                # process control such as NODE_OPTIONS/NODE_BIN/PATH.
+                if k in ENV_KEYS and v and "\x00" not in v:
+                    merged[k] = v
     return merged
 
 
@@ -202,7 +238,7 @@ def _spawn() -> subprocess.Popen:
     env["RAFTD_STATE"] = str(STATE)
     node = env.get("NODE_BIN", "node")
     _child = subprocess.Popen(
-        [node, "--experimental-transform-types",
+        [node,
          str(REPO_ROOT / "packages/agent/src/cli.ts"),
          "serve", "--state", str(STATE), "--host", "127.0.0.1", "--port", str(CHILD_PORT)],
         env=env, stdout=sys.stdout, stderr=sys.stderr,
@@ -213,10 +249,11 @@ def _spawn() -> subprocess.Popen:
 def _publish_port() -> None:
     """Only the wrapper owns public discovery; failure must prevent readiness."""
     STATE.mkdir(parents=True, exist_ok=True)
+    # The thin CLI must discover the public credential, never an old native
+    # token or the private credential of a managed child. Publish it first.
+    _write_private(STATE / "raftd.token", ADMIN_KEY)
     port_file = STATE / "raftd.port"
-    pending = STATE / "raftd.port.tmp"
-    pending.write_text(f"127.0.0.1:{PUBLIC_PORT}")
-    pending.replace(port_file)
+    _write_private(port_file, f"127.0.0.1:{PUBLIC_PORT}")
 
 
 def _unpublish_port() -> None:
@@ -332,6 +369,25 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="raftd cloud wrapper", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def verify_origin(req: Request, call_next):
+    origin = req.headers.get("origin")
+    if origin is not None:
+        try:
+            parsed = urlsplit(origin)
+            # Check the browser-visible authority. Ignore forwarded host
+            # headers entirely; they are not proof of a trusted proxy.
+            valid = (parsed.scheme in ("http", "https") and not parsed.username
+                     and not parsed.password and not parsed.path
+                     and not parsed.query and not parsed.fragment
+                     and parsed.netloc.lower() == req.headers.get("host", "").lower())
+        except ValueError:
+            valid = False
+        if not valid:
+            return JSONResponse({"error": "cross-origin request is not allowed"}, status_code=403)
+    return await call_next(req)
+
+
 @app.get("/healthz")
 async def healthz():
     child, instance = _child, _child_instance
@@ -357,20 +413,22 @@ async def setup_env(req: Request):
     try:
         body = await req.json()
     except Exception:
-        body = {}
+        return JSONResponse({"error": "request body is not valid JSON"}, status_code=400)
     if not isinstance(body, dict):
-        body = {}
+        return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
     # Merge into the existing merged view — a partial update must not wipe
     # other keys, and keys living only in the legacy file survive.
     existing = _load_envfile()
     saved = []
     for k in ENV_KEYS:
         v = body.get(k)
+        if isinstance(v, str) and (any(c in v for c in ("\r", "\n", "\x00")) or len(v.splitlines()) > 1):
+            return JSONResponse({"error": f"{k} must be a single-line value without NUL"}, status_code=400)
         if isinstance(v, str) and v.strip():
             existing[k] = v.strip()
             saved.append(k)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ENVFILE.write_text("".join(f"{k}={v}\n" for k, v in existing.items()))
+    _write_private(ENVFILE, "".join(f"{k}={v}\n" for k, v in existing.items()))
     return {"ok": True, "saved": saved, "hint": "POST /setup/restart to apply"}
 
 
@@ -392,7 +450,7 @@ async def _send_upstream(req: Request, path: str) -> httpx.Response | None:
     """Forward only responses belonging to the current, live child instance."""
     global _child_ready
     headers = {k: v for k, v in req.headers.items()
-               if k.lower() not in ("host", "content-length", "authorization")}
+               if k.lower() not in ("host", "content-length", "authorization", "origin")}
     params = [(k, v) for k, v in req.query_params.multi_items() if k != "key"]
     body = await req.body()
     for attempt in range(2):
@@ -400,13 +458,25 @@ async def _send_upstream(req: Request, path: str) -> httpx.Response | None:
             return None
         child, instance = _child, _child_instance
         headers["authorization"] = f"Bearer {_child_key}"
+        timeout = httpx.Timeout(120.0)
+        parts = [part for part in path.split("/") if part]
+        if req.method == "GET" and len(parts) >= 4 and parts[:2] == ["api", "agents"] and parts[3] == "answer":
+            # Match the child's slash-normalized route and allow its full
+            # 300-second ceiling plus response time. Let the child interpret
+            # query values (including repeated timeout keys); duplicating JS
+            # number/query parsing here can make the proxy expire too early.
+            timeout = httpx.Timeout(120.0, read=310.0)
         ureq = _client.build_request(req.method, f"/{path}",
-                                     headers=headers, params=params, content=body)
+                                     headers=headers, params=params, content=body, timeout=timeout)
         try:
             response = await _client.send(ureq, stream=True)
             if _is_current(child, instance) and _matches_instance(response, instance):
                 return response
             await response.aclose()
+        except httpx.ReadTimeout:
+            # A slow answer is not proof of child death. Do not replay it or
+            # turn healthy discovery/health into a startup failure.
+            raise
         except httpx.HTTPError:
             pass
         _child_ready = False
@@ -424,7 +494,10 @@ async def proxy(path: str, req: Request):
     if not _authed(req) and not (req.method == "GET" and path in ("", "favicon.ico")):
         return JSONResponse({"error": "unauthorized — pass ?key= or Authorization: Bearer"},
                             status_code=401)
-    upstream = await _send_upstream(req, path)
+    try:
+        upstream = await _send_upstream(req, path)
+    except httpx.ReadTimeout:
+        return JSONResponse({"error": "raftd response timeout"}, status_code=504)
     if upstream is None:
         return JSONResponse({"error": "raftd unavailable"}, status_code=503)
     # The upstream response must stay open until the stream finishes — aclose

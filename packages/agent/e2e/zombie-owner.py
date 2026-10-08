@@ -18,7 +18,7 @@ repo_agent = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 holder = subprocess.Popen(
     [
-        "node", "--experimental-transform-types", "--input-type=module", "-e",
+        "node", "--input-type=module", "-e",
         f'import {{MachineLock}} from "{repo_agent}/src/index.ts";'
         f'const l = await MachineLock.acquire("{state_dir}");'
         'console.log("HELD");'

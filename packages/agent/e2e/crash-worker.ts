@@ -7,7 +7,7 @@
  *   recover — open + resume on the same state, wait for that submission to
  *             settle, print `SETTLED <id> <status>` and exit.
  *
- * Usage: node --experimental-transform-types e2e/crash-worker.ts <worker|recover> <stateDir> <agent> <submissionId?>
+ * Usage: node e2e/crash-worker.ts <worker|recover> <stateDir> <agent> <submissionId?>
  */
 import { existsSync, readFileSync } from "node:fs";
 

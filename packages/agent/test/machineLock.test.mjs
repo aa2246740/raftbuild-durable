@@ -81,7 +81,7 @@ async function fixture(t) {
     locks,
     async acquire(options) { const lock = await MachineLock.acquire(dir, options); locks.push(lock); return lock; },
     worker(mode = 'hold') {
-      const worker = channel(spawn(process.execPath, ['--experimental-transform-types', holder, dir, mode], {
+      const worker = channel(spawn(process.execPath, [holder, dir, mode], {
         stdio: ['pipe', 'pipe', 'pipe'],
       }));
       workers.push(worker);

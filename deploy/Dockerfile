@@ -15,7 +15,8 @@ COPY packages/agent packages/agent
 
 WORKDIR /app
 COPY deploy/app /app/app
-RUN python3 -m venv /venv && /venv/bin/pip install fastapi uvicorn httpx
+COPY deploy/pyproject.toml /app/pyproject.toml
+RUN python3 -m venv /venv && /venv/bin/pip install .
 ENV PATH=/venv/bin:$PATH
 ENV RAFTD_REPO=/raftbuild-durable
 ENV RAFTD_STATE=/data/raftd

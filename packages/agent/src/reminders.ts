@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { defineDoc } from "@earendil-works/pi-durable";
 
 import type { DurableDaemon } from "./daemon.ts";
+import { AgentRegistryError } from "./agents.ts";
 
 export type Reminder = {
   id: string;
@@ -18,6 +19,8 @@ export type Reminder = {
   text: string;
   /** ISO instant of the next fire. */
   dueAt: string;
+  /** Zone used to interpret the request; older persisted rows default to UTC. */
+  timeZone?: string;
   /** Repeat interval in ms; null = one-shot. */
   everyMs: number | null;
   createdAt: string;
@@ -33,35 +36,41 @@ export const RemindersDoc = defineDoc<RemindersState>({
 });
 
 /** Parse "in 30m" | "in 2h" | "every 10m" | "at 14:30" | ISO into {dueAt, everyMs}. */
-export function parseWhen(spec: string, now = new Date()): { dueAt: string; everyMs: number | null } {
-  const rel = spec.match(/^(in|every)\s+(\d+)\s*(s|m|h|d)$/i);
+export function parseWhen(spec: string, now = new Date()): { dueAt: string; everyMs: number | null; timeZone: string } {
+  const text = spec.trim();
+  const invalid = () => new Error(`cannot parse when: "${spec}" (use "in 30m", "every 1h", "at 14:30", or a future ISO timestamp with Z/offset)`);
+  const rel = text.match(/^(in|every)\s+(\d+)\s*(s|m|h|d)$/i);
   if (rel) {
     const n = Number(rel[2]);
-    const unit = rel[3].toLowerCase();
+    const unit = rel[3]!.toLowerCase();
     const ms = n * (unit === "s" ? 1_000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000);
-    const everyMs = rel[1].toLowerCase() === "every" ? ms : null;
-    // A repeating timer under 1s is a hot submit loop that bricks the
-    // agent's outbox (verified: `every 0s` → overflow → unreliable).
-    if (everyMs !== null && everyMs < 1_000) {
-      throw new Error(`repeating reminders need an interval >= 1s (got "${spec}")`);
-    }
-    return { dueAt: new Date(now.getTime() + ms).toISOString(), everyMs };
+    if (!Number.isSafeInteger(ms) || ms < 1_000 || !Number.isFinite(new Date(now.getTime() + ms).getTime())) throw invalid();
+    return { dueAt: new Date(now.getTime() + ms).toISOString(), everyMs: rel[1]!.toLowerCase() === "every" ? ms : null, timeZone: "UTC" };
   }
-  const at = spec.match(/^at\s+(\d{1,2}):(\d{2})$/i);
+  const at = text.match(/^at\s+(\d{1,2}):(\d{2})$/i);
   if (at) {
-    const hh = Number(at[1]);
-    const mm = Number(at[2]);
-    // setHours normalizes overflow (25:99 → next day 02:39) — reject it.
-    if (hh > 23) throw new Error(`invalid hour ${hh} in "${spec}" (0–23)`);
-    if (mm > 59) throw new Error(`invalid minute ${mm} in "${spec}" (0–59)`);
+    const hh = Number(at[1]), mm = Number(at[2]);
+    if (hh > 23 || mm > 59) throw invalid();
     const d = new Date(now);
     d.setHours(hh, mm, 0, 0);
     if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
-    return { dueAt: d.toISOString(), everyMs: null };
+    return { dueAt: d.toISOString(), everyMs: null, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone };
   }
-  const iso = new Date(spec);
-  if (!Number.isNaN(iso.getTime())) return { dueAt: iso.toISOString(), everyMs: null };
-  throw new Error(`cannot parse when: "${spec}" (try "in 30m", "every 1h", "at 14:30", or ISO)`);
+  // Date.parse alone accepts numbers, locale dates, missing zones, and even
+  // normalizes impossible calendar days. Validate all fields before parsing.
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/);
+  if (!iso) throw invalid();
+  const [year, month, day, hour, minute, second] = iso.slice(1, 7).map(Number);
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year!, month! - 1, day!);
+  calendar.setUTCHours(hour!, minute!, second!, 0);
+  if (calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month! - 1 || calendar.getUTCDate() !== day || hour! > 23 || minute! > 59 || second! > 59) throw invalid();
+  const zone = iso[8]!;
+  if (zone !== "Z" && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4)) > 59)) throw invalid();
+  const due = new Date(text);
+  if (!Number.isFinite(due.getTime())) throw invalid();
+  if (due.getTime() <= now.getTime()) throw new Error(`reminder time must be in the future: "${spec}"`);
+  return { dueAt: due.toISOString(), everyMs: null, timeZone: zone === "Z" ? "UTC" : `UTC${zone}` };
 }
 
 // Node clamps setTimeout delays > ~24.8 days to 1ms — without a wake-up
@@ -69,10 +78,12 @@ export function parseWhen(spec: string, now = new Date()): { dueAt: string; ever
 const MAX_TIMEOUT_MS = 2_147_483_000;
 
 export class ReminderService {
+  private readonly daemon: DurableDaemon;
   private readonly timers = new Map<string, { handle: NodeJS.Timeout; dueAt: string }>();
   private stopped = false;
 
-  constructor(private readonly daemon: DurableDaemon) {
+  constructor(daemon: DurableDaemon) {
+    this.daemon = daemon;
     daemon.setReminderHook(() => void this.resync());
   }
 
@@ -129,6 +140,7 @@ export class ReminderService {
       this.arm(t);
       return;
     }
+    let permanentlyMissing = false;
     const delivered = await this.daemon
       .postMessage(t.agentId, `Reminder: ${t.text}`, {
         systemNotice: true,
@@ -136,9 +148,15 @@ export class ReminderService {
       })
       .then(() => true)
       .catch((err) => {
+        permanentlyMissing = err instanceof AgentRegistryError && err.code === "not_found";
+        if (permanentlyMissing) return false;
         console.error(`[reminders] fire ${t!.id} failed:`, err);
         return false;
       });
+    if (!delivered && permanentlyMissing) {
+      await this.daemon.deleteReminder(t.id).catch(() => {});
+      return;
+    }
     if (!delivered) {
       // Keep the row AND re-arm for a retry — a stopped agent that later
       // starts must still get the reminder (startAgent/resolveAgent also

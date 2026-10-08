@@ -69,11 +69,14 @@ export const outcomeReceiptKey = (agentId: string, submissionId: string): string
   JSON.stringify([agentId, submissionId]);
 
 export class OutboxError extends Error {
+  readonly code: "unreliable" | "overflow" | "not_found";
+
   constructor(
     message: string,
-    readonly code: "unreliable" | "overflow" | "not_found",
+    code: "unreliable" | "overflow" | "not_found",
   ) {
     super(message);
+    this.code = code;
     this.name = "OutboxError";
   }
 }
@@ -138,21 +141,31 @@ function isTurnCompleted(entry: OutboxDocEntry): boolean {
  * timer (started lazily on first append).
  */
 export class AgentOutbox {
+  private readonly harness: Harness;
+  private readonly ctx: Context;
+  readonly agentId: string;
+  private readonly transport: OutboxTransport;
   private pumpTimer: NodeJS.Timeout | null = null;
   private pumping = false;
   private stopped = false;
   private readonly retryDelayMs: (attempt: number) => number;
   private pendingNotify: (() => void) | null = null;
+  /** Retain a wake that races the current pump's final state read/exit. */
+  private wakeRequested = false;
   /** In-memory unreliability (a commit failure we couldn't even durably record). */
   private memoryUnreliable: string | undefined;
 
   constructor(
-    private readonly harness: Harness,
-    private readonly ctx: Context,
-    readonly agentId: string,
-    private readonly transport: OutboxTransport,
+    harness: Harness,
+    ctx: Context,
+    agentId: string,
+    transport: OutboxTransport,
     opts: { retryDelayMs?: (attempt: number) => number } = {},
   ) {
+    this.harness = harness;
+    this.ctx = ctx;
+    this.agentId = agentId;
+    this.transport = transport;
     this.retryDelayMs = opts.retryDelayMs ?? ((attempt) => retransmitDelayMs(attempt));
   }
 
@@ -286,9 +299,11 @@ export class AgentOutbox {
   /** Wake the pump (after append/requeue/resolve). */
   kick(): void {
     if (this.stopped) return;
+    this.wakeRequested = true;
     if (this.pumpTimer === null && !this.pumping) {
       this.pumpTimer = setTimeout(() => {
         this.pumpTimer = null;
+        this.wakeRequested = false;
         void this.pumpOnce();
       }, 0);
       this.pumpTimer.unref?.();
@@ -348,12 +363,14 @@ export class AgentOutbox {
           // in-flight (never folded), exactly like the daemon.
           const delay = this.retryDelayMs(next.attempts + 1);
           await new Promise<void>((resolve) => {
-            this.pendingNotify = resolve;
-            this.pumpTimer = setTimeout(() => {
+            const wake = () => {
+              if (this.pumpTimer) clearTimeout(this.pumpTimer);
               this.pumpTimer = null;
               this.pendingNotify = null;
               resolve();
-            }, delay);
+            };
+            this.pendingNotify = wake;
+            this.pumpTimer = setTimeout(wake, delay);
             this.pumpTimer.unref?.();
           });
           if (this.stopped) return;
@@ -383,6 +400,10 @@ export class AgentOutbox {
     } finally {
       this.pumping = false;
       this.pendingNotify = null;
+      if (this.wakeRequested) {
+        this.wakeRequested = false;
+        this.kick();
+      }
     }
   }
 }

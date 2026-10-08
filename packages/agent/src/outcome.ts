@@ -6,7 +6,8 @@
  *  - E2 `turn_completed`: per-turn counters and the rule deciding whether a
  *    turn end is clean evidence.
  *
- * Semantics unchanged; the types are this port's local ones.
+ * Durable settlement is authoritative: done remains successful after a
+ * recovered retry; transient errors are kept in the event transcript.
  */
 import { buildRuntimeErrorDiagnostic } from "./diagnostics.ts";
 import type { AgentRuntimeOutcome, ParsedEvent, TerminalFailureKind } from "./types.ts";
@@ -41,9 +42,8 @@ export function terminalFailureFromRawText(
 }
 
 /**
- * Per-turn facts for E2. Reset only at run end: an error anywhere since the
- * previous run end disqualifies the run. Mirrors the daemon's rule — it can
- * delay evidence, never produce a false one.
+ * Per-turn facts for E2. Recoverable attempt errors remain useful telemetry;
+ * the durable submission's final settlement decides success or failure.
  */
 export interface TurnOutcomeCounters {
   textEvents: number;
@@ -70,18 +70,17 @@ export function noteTurnOutcomeEvent(counters: TurnOutcomeCounters, event: Parse
 }
 
 /**
- * Conditions: no sticky terminal failure, zero runtime errors in the run, and
- * model output. Returns the E2 outcome or null.
+ * A done submission is successful even after retryable attempt errors.
+ * Call only after the authoritative durable settlement is `done`.
  */
 export function turnCompletedOutcome(
   counters: TurnOutcomeCounters,
-  stickyTerminalFailure: boolean,
-): Extract<AgentRuntimeOutcome, { kind: "turn_completed" }> | null {
-  if (stickyTerminalFailure || counters.runtimeErrors > 0) return null;
-  if (counters.textEvents + counters.toolCalls === 0) return null;
+  _stickyTerminalFailure = false,
+): Extract<AgentRuntimeOutcome, { kind: "turn_completed" }> {
   return {
     kind: "turn_completed",
     textEvents: counters.textEvents,
     toolCalls: counters.toolCalls,
+    ...(counters.runtimeErrors > 0 ? { recoveredErrors: counters.runtimeErrors } : {}),
   };
 }

@@ -1,5 +1,5 @@
 // Hold a real machine lock while the parent tests SIGSTOP/SIGKILL behavior.
-// Usage: node --experimental-transform-types lock-mutex-holder.mjs <stateDir>
+// Usage: node lock-mutex-holder.mjs <stateDir>
 import { MachineLock } from "../src/machineLock.ts";
 
 const lock = await MachineLock.acquire(process.argv[2]);

@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 PUBLIC_KEY = "wrapper-regression-public-key"
 PROVIDER_KEYS = (
     "ZAI_CODING_CN_API_KEY", "zhipu", "ZAI_API_KEY", "MINIMAX_CN_API_KEY",
-    "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY", "MINIMAX_CN", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 )
 
 
@@ -58,7 +58,8 @@ def eventually(predicate, timeout=30):
 
 
 class Wrapper:
-    def __init__(self, child_port=None, node=None, delayed=False):
+    def __init__(self, child_port=None, node=None, delayed=False, key=PUBLIC_KEY,
+                 envfile=None, legacy_envfile=None, stale_token=None):
         self.temp = tempfile.TemporaryDirectory(prefix="raftd-wrapper-test-")
         self.data = Path(self.temp.name)
         self.state = self.data / "state"
@@ -68,12 +69,16 @@ class Wrapper:
         while self.child_port == self.port:
             self.port = free_port()
         self.env = os.environ.copy()
-        for key in (*PROVIDER_KEYS, "NODE_OPTIONS", "RAFTD_WRAPPER_INSTANCE"):
-            self.env.pop(key, None)
+        for variable in (*PROVIDER_KEYS, "NODE_OPTIONS", "RAFTD_WRAPPER_INSTANCE"):
+            self.env.pop(variable, None)
         self.env.update(PORT=str(self.port), RAFTD_CHILD_PORT=str(self.child_port),
                         RAFTD_DATA=str(self.data), RAFTD_STATE=str(self.state),
                         RAFTD_REPO=str(REPO), RAFTD_KEY=PUBLIC_KEY,
                         PYTHONPATH=str(REPO / "deploy"))
+        if key is None:
+            self.env.pop("RAFTD_KEY", None)
+        else:
+            self.env["RAFTD_KEY"] = key
         if delayed:
             shim = self.data / "delayed-node"
             shim.write_text(f"#!{sys.executable}\nimport os,sys,time\ntime.sleep(0.5)\nos.execvp('node', ['node', *sys.argv[1:]])\n")
@@ -83,8 +88,10 @@ class Wrapper:
             self.env["NODE_BIN"] = node
         else:
             self.env.pop("NODE_BIN", None)
-        (self.state / "child.env").write_text("DEEPSEEK_API_KEY=legacy-fixture\nOPENAI_API_KEY=old-fixture\n")
-        (self.data / ".env").write_text("OPENAI_API_KEY=current-fixture\n")
+        (self.state / "child.env").write_text(legacy_envfile if legacy_envfile is not None else "DEEPSEEK_API_KEY=legacy-fixture\nOPENAI_API_KEY=old-fixture\n")
+        (self.data / ".env").write_text(envfile if envfile is not None else "OPENAI_API_KEY=current-fixture\n")
+        if stale_token is not None:
+            (self.state / "raftd.token").write_text(stale_token)
         self.log = (self.data / "wrapper.log").open("w+")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(self.port)],
@@ -102,8 +109,12 @@ class Wrapper:
         return json.loads((self.state / "raftd.lock").read_text())["pid"]
 
     def cli(self, key=PUBLIC_KEY):
-        env = dict(self.env, RAFTD_KEY=key)
-        return subprocess.run(["node", "--experimental-transform-types",
+        env = dict(self.env)
+        if key is None:
+            env.pop("RAFTD_KEY", None)
+        else:
+            env["RAFTD_KEY"] = key
+        return subprocess.run(["node",
                                str(REPO / "packages/agent/src/cli.ts"), "list", "--state", str(self.state)],
                               cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
 
@@ -182,6 +193,63 @@ def foreign_server(port=0):
 
 
 class WrapperIntegrationTests(unittest.TestCase):
+    def test_cli_discovers_public_token_and_overwrites_stale_native_token(self):
+        with Wrapper(stale_token="old-native-token") as wrapper:
+            wrapper.ready()
+            token = wrapper.state / "raftd.token"
+            self.assertEqual(token.read_text(), PUBLIC_KEY)
+            self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+            cli = wrapper.cli(key=None)
+            self.assertEqual(cli.returncode, 0, cli.stderr)
+
+    def test_generated_admin_key_is_private_and_never_logged(self):
+        with Wrapper(key=None) as wrapper:
+            wrapper.ready()
+            admin_file = wrapper.state / "admin-key"
+            admin_key = admin_file.read_text()
+            self.assertGreaterEqual(len(admin_key), 32)
+            self.assertEqual(admin_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((wrapper.state / "raftd.token").read_text(), admin_key)
+            self.assertEqual(wrapper.cli(key=None).returncode, 0)
+            wrapper.log.flush()
+            logged = (wrapper.data / "wrapper.log").read_text()
+            self.assertNotIn(admin_key, logged)
+            self.assertNotIn("raftd-child-", logged)
+
+    def test_env_files_cannot_inject_process_options_and_invalid_updates_are_atomic(self):
+        with Wrapper(envfile="OPENAI_API_KEY=fixture\nNODE_OPTIONS=--not-a-node-option\nNODE_BIN=/bin/false\n",
+                     legacy_envfile="DEEPSEEK_API_KEY=legacy-fixture\nMINIMAX_CN=legacy-cn-fixture\nPATH=/nonexistent\n") as wrapper:
+            wrapper.ready()  # Old code applies NODE_OPTIONS/NODE_BIN and fails here.
+            self.assertEqual((wrapper.data / ".env").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((wrapper.state / "child.env").stat().st_mode & 0o777, 0o600)
+            original = (wrapper.data / ".env").read_text()
+            for value in ("fixture\nNODE_OPTIONS=--not-a-node-option", "fixture\rNODE_BIN=/bin/false", "fixture\x00value"):
+                response = wrapper.request("/setup/env", method="POST", body={"OPENAI_API_KEY": value})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual((wrapper.data / ".env").read_text(), original)
+            response = wrapper.request("/setup/env", method="POST", body={"OPENAI_API_KEY": "replacement", "NODE_OPTIONS": "ignored"})
+            self.assertEqual(response.status_code, 200)
+            saved = wrapper.data / ".env"
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(saved.read_text(), "DEEPSEEK_API_KEY=legacy-fixture\nMINIMAX_CN=legacy-cn-fixture\nOPENAI_API_KEY=replacement\n")
+            self.assertTrue(wrapper.request("/setup/restart", method="POST", body={}).json()["ok"])
+            self.assertEqual(wrapper.request().status_code, 200)
+
+    def test_public_origin_is_checked_before_forwarding_to_local_child(self):
+        with Wrapper() as wrapper:
+            wrapper.ready()
+            headers = {"authorization": f"Bearer {PUBLIC_KEY}", "origin": f"http://127.0.0.1:{wrapper.port}"}
+            self.assertEqual(wrapper.client.get("/api/state", headers=headers).status_code, 200)
+            headers["origin"] = "https://foreign.invalid"
+            headers["x-forwarded-host"] = "foreign.invalid"
+            self.assertEqual(wrapper.client.get("/api/state", headers=headers).status_code, 403)
+            self.assertEqual(wrapper.client.post("/setup/env", headers=headers, json={"OPENAI_API_KEY": "rejected"}).status_code, 403)
+            # Fly terminates TLS upstream: compare the public Host, without
+            # trusting a caller-controlled forwarded host or leaking Origin
+            # into the separately authenticated loopback child.
+            headers.update(host="raftd.example", origin="https://raftd.example")
+            self.assertEqual(wrapper.client.get("/api/state", headers=headers).status_code, 200)
+
     def test_second_wrapper_cannot_change_first_wrappers_discovery(self):
         with Wrapper() as first:
             first.ready()
@@ -222,7 +290,7 @@ class WrapperIntegrationTests(unittest.TestCase):
                        RAFTD_KEY=PUBLIC_KEY, PYTHONPATH=str(REPO / "deploy"))
             with (data / "native.log").open("w+") as native_log, (data / "wrapper.log").open("w+") as wrapper_log:
                 native = subprocess.Popen(
-                    ["node", "--experimental-transform-types", str(REPO / "packages/agent/src/cli.ts"),
+                    ["node", str(REPO / "packages/agent/src/cli.ts"),
                      "serve", "--state", str(state), "--port", str(native_port)],
                     cwd=REPO, env=env, stdout=native_log, stderr=native_log)
                 wrapper = None
@@ -240,7 +308,7 @@ class WrapperIntegrationTests(unittest.TestCase):
                         self.assertEqual((state / "raftd.port").read_text(), expected)
                         self.assertEqual(native_status(), 200)
                         cli = subprocess.run(
-                            ["node", "--experimental-transform-types", str(REPO / "packages/agent/src/cli.ts"), "list", "--state", str(state)],
+                            ["node", str(REPO / "packages/agent/src/cli.ts"), "list", "--state", str(state)],
                             cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
                         self.assertEqual(cli.returncode, 0, cli.stderr)
                 finally:
@@ -325,7 +393,7 @@ class WrapperIntegrationTests(unittest.TestCase):
             self.assertEqual(wrapper.request("/healthz", key=None).status_code, 503)
             self.assertFalse(alive(previous_pid))
             native = subprocess.run(
-                ["node", "--experimental-transform-types", str(REPO / "packages/agent/src/cli.ts"),
+                ["node", str(REPO / "packages/agent/src/cli.ts"),
                  "serve", "--state", str(wrapper.state), "--port", str(free_port())],
                 cwd=REPO, env=wrapper.env, capture_output=True, text=True, timeout=10)
             self.assertNotEqual(native.returncode, 0)
@@ -372,6 +440,51 @@ class WrapperIntegrationTests(unittest.TestCase):
 
 
 class SharedStartupCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_answer_budget_and_timeout_keep_healthy_child_ready(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"RAFTD_DATA": directory, "RAFTD_STATE": directory}):
+            spec = importlib.util.spec_from_file_location("wrapper_answer_test", REPO / "deploy/app/main.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        class LiveChild:
+            def poll(self):
+                return None
+        module.ADMIN_KEY = PUBLIC_KEY
+        module._child = LiveChild()
+        module._child_key = "private-fixture-key"
+        module._child_instance = "fixture-instance"
+        module._child_ready = True
+        answers = []
+        force_timeout = False
+
+        def upstream(request):
+            headers = {"x-raftd-instance": "fixture-instance", "content-type": "application/json"}
+            if request.url.path.rstrip("/").endswith("/answer"):
+                answers.append(request)
+                if force_timeout:
+                    raise httpx.ReadTimeout("controlled slow answer", request=request)
+                return httpx.Response(504, headers=headers, stream=httpx.ByteStream(b'{"error":"answer deadline"}'))
+            return httpx.Response(200, headers=headers, stream=httpx.ByteStream(b'{"ok":true}'))
+
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:4893", timeout=httpx.Timeout(120.0),
+                                     transport=httpx.MockTransport(upstream)) as child:
+            module._client = child
+            async with httpx.AsyncClient(base_url="https://raftd.example", transport=httpx.ASGITransport(app=module.app)) as edge:
+                headers = {"authorization": f"Bearer {PUBLIC_KEY}", "origin": "https://raftd.example"}
+                for route in ("answer?submissionId=1&timeout=300", "answer/?submissionId=1&timeout=300",
+                              "answer?submissionId=1&timeout=300&timeout=1"):
+                    response = await edge.get(f"/api/agents/fixture/{route}", headers=headers)
+                    self.assertEqual(response.status_code, 504)
+                    self.assertEqual(response.json(), {"error": "answer deadline"})
+                    self.assertGreater(answers[-1].extensions["timeout"]["read"], 300)
+                self.assertNotIn("origin", answers[0].headers)
+                self.assertEqual(answers[0].headers["authorization"], "Bearer private-fixture-key")
+                force_timeout = True
+                response = await edge.get("/api/agents/fixture/answer?submissionId=1&timeout=300", headers=headers)
+                self.assertEqual(response.status_code, 504)
+                self.assertEqual(len(answers), 4, "a timed-out answer must not be retried")
+                self.assertTrue(module._child_ready)
+                self.assertEqual((await edge.get("/healthz")).status_code, 200)
+
     async def test_cancelled_request_does_not_cancel_shared_startup(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"RAFTD_DATA": directory, "RAFTD_STATE": directory, "RAFTD_KEY": PUBLIC_KEY}):
             spec = importlib.util.spec_from_file_location("wrapper_under_test", REPO / "deploy/app/main.py")
