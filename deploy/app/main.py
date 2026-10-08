@@ -34,6 +34,7 @@ from starlette.background import BackgroundTask
 DATA_DIR = Path(os.environ.get("RAFTD_DATA", "/data"))
 STATE = Path(os.environ.get("RAFTD_STATE", str(DATA_DIR / ".raftd")))
 CHILD_PORT = int(os.environ.get("RAFTD_CHILD_PORT", "4893"))
+PUBLIC_PORT = int(os.environ.get("PORT", "8080"))
 REPO_ROOT = Path(os.environ.get("RAFTD_REPO", "/raftbuild-durable"))
 ENVFILE = DATA_DIR / ".env"
 LEGACY_ENVFILE = STATE / "child.env"  # pre-2026-10 location — still honored
@@ -54,6 +55,8 @@ ENV_KEYS = (
 _child: subprocess.Popen | None = None
 _client: httpx.AsyncClient | None = None
 _child_key = f"raftd-child-{secrets.token_hex(16)}"  # internal only, per boot
+_ready_task: "asyncio.Task[bool] | None" = None
+_child_ready = False
 
 
 def _load_admin_key() -> str:
@@ -136,9 +139,43 @@ def _spawn() -> bool:
     return True
 
 
-async def _ensure_up() -> bool:
+def _publish_port() -> None:
+    """Thin-CLI discovery: raftd.port must name the PUBLIC entry (this
+    wrapper), not the child's loopback port — the key a CLI user holds is
+    the public admin key, which only we accept. The child writes its own
+    port at startup; we overwrite it once the child is actually ready (and
+    after every respawn). raftd.internal-port keeps the real child port
+    discoverable for debugging."""
+    try:
+        (STATE / "raftd.port").write_text(f"127.0.0.1:{PUBLIC_PORT}")
+        (STATE / "raftd.internal-port").write_text(f"127.0.0.1:{CHILD_PORT}")
+    except OSError:
+        pass
+
+
+async def _bring_up() -> bool:
+    global _child_ready
     _spawn()
-    return await _wait_ready()
+    ok = await _wait_ready()
+    _child_ready = ok
+    if ok:
+        _publish_port()
+    return ok
+
+
+async def _ensure_up() -> bool:
+    """Shared bring-up. A live child pid is NOT proof of readiness (the
+    process exists before it listens), so every caller — the boot task and
+    N concurrent requests after a crash — awaits the SAME readiness task
+    instead of each probing/respawning on its own."""
+    global _ready_task, _child_ready
+    if _child is not None and _child.poll() is not None:
+        _child_ready = False
+    if _child_ready:
+        return True
+    if _ready_task is None or _ready_task.done():
+        _ready_task = asyncio.create_task(_bring_up())
+    return await _ready_task
 
 
 def _stop_child() -> None:
@@ -231,8 +268,11 @@ async def _send_upstream(req: Request, path: str) -> httpx.Response | None:
         try:
             return await _client.send(ureq, stream=True)
         except httpx.HTTPError:
-            # Child died between health and request — respawn once, retry once.
-            if attempt == 0 and _spawn() and await _wait_ready(60):
+            # Child died or isn't listening yet — every waiter shares ONE
+            # bring-up task; a live pid without readiness is not served.
+            global _child_ready
+            _child_ready = False
+            if attempt == 0 and await _ensure_up():
                 continue
             return None
     return None
@@ -245,8 +285,10 @@ async def proxy(path: str, req: Request):
     if not _authed(req) and not (req.method == "GET" and path in ("", "favicon.ico")):
         return JSONResponse({"error": "unauthorized — pass ?key= or Authorization: Bearer"},
                             status_code=401)
-    if _child is None or _child.poll() is not None:
-        # Respawn on demand — a crashed child shouldn't leave every request 502.
+    if not _child_ready:
+        # Not ready (dead OR still starting) — join the shared bring-up
+        # rather than racing a raw connection against a pid that only just
+        # spawned. A hard refusal here is an explicit 503, never a 502.
         if not await _ensure_up():
             return JSONResponse({"error": "raftd is starting"}, status_code=503)
     upstream = await _send_upstream(req, path)

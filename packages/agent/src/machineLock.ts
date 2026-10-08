@@ -2,16 +2,17 @@
  * Machine lock — the daemon's machineLock.ts, reduced to one lock file.
  *
  * One `raftd` owns a state dir at a time. The lock file holds {pid, token,
- * startedAt}. Semantics:
+ * startedAt, pidStart}. Semantics:
  * - a live pid that still looks like a raftd process → refuse (locked);
  * - EPERM probing (live process owned by another user) → refuse, never
  *   "take over" a process we can't inspect;
- * - a dead pid, or a live pid whose /proc cmdline is clearly not ours
- *   (pid reuse after reboot) → stale lock, take over;
- * - acquire is an atomic create (O_EXCL) — two racing serves cannot both win.
+ * - a dead pid, a ZOMBIE pid (dead but not yet waited on), or a live pid
+ *   whose kernel starttime differs from the recorded one (pid reuse) →
+ *   stale lock, take over;
+ * - acquire is an atomic create (link()) — two racing serves cannot both win.
  */
 import { readFileSync, statSync } from "node:fs";
-import { link, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -26,34 +27,54 @@ export class MachineLockError extends Error {
 
 type LockOwner = { pid: number; token: string; startedAt: string; pidStart?: string };
 
-/** /proc/<pid>/stat field 22 — kernel starttime, survives nothing but the pid itself. */
-export function processStartTime(pid: number): string | undefined {
+export type ProcInfo = { state: string; pgrp: number; start: string };
+
+/** /proc/<pid>/stat parsed once: state, process group, kernel starttime. */
+export function procInfo(pid: number): ProcInfo | undefined {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // comm may contain spaces/parens — parse after the last ')'.
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    return fields[19]; // field 22 overall
+    return { state: fields[0], pgrp: Number(fields[2]), start: fields[19] }; // fields 3/5/22 overall
   } catch {
     return undefined;
   }
 }
 
-/** true = the recorded owner is alive; false = dead or a recycled pid. */
-function ownerAlive(owner: LockOwner): boolean {
-  try {
-    process.kill(owner.pid, 0);
-  } catch (err) {
-    // EPERM = the process exists but is another user's — alive, never
-    // "take over" a process we can't inspect. ESRCH = dead.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+/** /proc/<pid>/stat field 22 — kernel starttime, survives nothing but the pid itself. */
+export function processStartTime(pid: number): string | undefined {
+  return procInfo(pid)?.start;
+}
+
+/** States that are dead-for-real: zombie (dead, not yet reaped) and exiting. */
+export const DEAD_STATES = new Set(["Z", "X", "x"]);
+
+/**
+ * true = the pid belongs to a live, executing process. A zombie fails
+ * kill(0) semantics the other way — it EXISTS so kill(0) succeeds, but it
+ * is dead, so /proc state is consulted first (falling back to kill(0) on
+ * platforms without /proc). pidStart disambiguates recycled pids.
+ */
+export function processAlive(pid: number, pidStart?: string): boolean {
+  const info = procInfo(pid);
+  if (info === undefined) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      // EPERM = the process exists but is another user's — alive, never
+      // "take over" a process we can't inspect. ESRCH = dead.
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+    return true;
   }
-  // A live pid can still be a RECYCLED pid after a reboot: compare kernel
-  // start times. Old locks without pidStart get the benefit of the doubt.
-  if (owner.pidStart !== undefined) {
-    const now = processStartTime(owner.pid);
-    if (now !== undefined && now !== owner.pidStart) return false;
-  }
+  if (DEAD_STATES.has(info.state)) return false;
+  if (pidStart !== undefined && info.start !== pidStart) return false;
   return true;
+}
+
+/** true = the recorded owner is alive; false = dead, zombie, or recycled pid. */
+function ownerAlive(owner: LockOwner): boolean {
+  return processAlive(owner.pid, owner.pidStart);
 }
 
 /** Read the lock; null = absent/unreadable, owner.alive reports pid state. */
@@ -69,36 +90,87 @@ export function inspectLock(stateDir: string): { owner: LockOwner; alive: boolea
   }
 }
 
+const TAKEOVER_OWNER_FILE = "owner.json";
+
 /**
- * Serializes stale-lock takeover. A stale lock must be removed before a fresh
- * link() can land, and inspect→remove is a check-then-act window: without a
- * mutex two racers can each delete the other's just-created live lock. mkdir()
- * is atomic on POSIX, so `<lock>.takeover/` is the mutex. Holders finish in
- * microseconds; a dir older than 30s belongs to a crashed holder and is
- * force-reaped. Returns false when the mutex stayed contended — callers retry.
+ * Try to remove a takeover-mutex dir. Reaping rules:
+ * - owner.json present and its process ALIVE (a SIGSTOP'd holder counts —
+ *   pausing is not crashing) → never reap;
+ * - owner.json present and its process dead/zombie/reused → reap;
+ * - owner.json absent (holder died between mkdir and the identity write)
+ *   → reap only once the dir is older than 30s.
+ */
+async function reapMutexDirIfDead(dir: string): Promise<boolean> {
+  const st = await stat(dir).catch(() => null);
+  if (st === null) return false;
+  let owner: LockOwner | null = null;
+  try {
+    owner = JSON.parse(await readFile(path.join(dir, TAKEOVER_OWNER_FILE), "utf8")) as LockOwner;
+  } catch {
+    /* absent or malformed */
+  }
+  if (owner !== null && typeof owner.pid === "number") {
+    if (ownerAlive(owner)) return false;
+    await rm(dir, { recursive: true, force: true });
+    return true;
+  }
+  if (Date.now() - st.mtimeMs > 30_000) {
+    await rm(dir, { recursive: true, force: true });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Serializes stale-lock takeover. mkdir() is the atomic claim, then the
+ * winner writes owner.json — its identity — inside the dir. A contender may
+ * only break the mutex when that identity is DEAD (see reapMutexDirIfDead),
+ * so a holder paused mid-critical-section keeps exclusive ownership.
+ *
+ * The mkdir→owner.json gap is guarded by a post-write verification: if the
+ * dir was legitimately reaped and recreated while we wrote, the inode moved
+ * and we abort instead of acting on someone else's mutex. Release is
+ * token-checked for the same reason.
  */
 async function withTakeoverMutex<T>(dir: string, fn: () => Promise<T>): Promise<T | undefined> {
-  for (let i = 0; i < 200; i++) {
+  const token = randomUUID();
+  for (let i = 0; i < 240; i++) {
+    let ino: number;
     try {
       await mkdir(dir);
-      break;
+      ino = (await stat(dir)).ino;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const st = await stat(dir).catch(() => null);
-      if (st === null) continue;
-      if (Date.now() - st.mtimeMs > 30_000) {
-        await rm(dir, { recursive: true, force: true });
-        continue;
-      }
+      await reapMutexDirIfDead(dir);
       await new Promise((r) => setTimeout(r, 25));
-      if (i === 199) return undefined;
+      if (i === 239) return undefined;
+      continue;
+    }
+    // Claimed. Publish identity before running fn; a pre-publish crash leaves
+    // a fileless dir that ages out on the 30s fallback.
+    try {
+      await writeFile(
+        path.join(dir, TAKEOVER_OWNER_FILE),
+        JSON.stringify({ pid: process.pid, token, pidStart: processStartTime(process.pid) }),
+      );
+    } catch {
+      continue; // dir vanished underneath us — recreate next round
+    }
+    if ((await stat(dir).catch(() => null))?.ino !== ino) continue; // reaped+recreated
+    try {
+      return await fn();
+    } finally {
+      try {
+        const owner = JSON.parse(
+          await readFile(path.join(dir, TAKEOVER_OWNER_FILE), "utf8"),
+        ) as LockOwner;
+        if (owner.token === token) await rm(dir, { recursive: true, force: true });
+      } catch {
+        /* mutex dir already gone */
+      }
     }
   }
-  try {
-    return await fn();
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  return undefined;
 }
 
 export class MachineLock {

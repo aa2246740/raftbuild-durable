@@ -20,9 +20,9 @@
  * Run: pnpm e2e          (needs a real model key: zhipu or ZAI_CODING_CN_API_KEY)
  * Report: e2e/report.md
  */
-import { spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -32,6 +32,9 @@ import {
   MachineLock,
   MachineLockError,
   processStartTime,
+  procInfo,
+  DEAD_STATES,
+  trackToolChildren,
   AgentsDoc,
   JsonlDeliveryTransport,
   OutboxDoc,
@@ -51,11 +54,22 @@ import {
 
 const MODEL = { provider: "zai-coding-cn", modelId: "glm-5.3-flash" };
 const PKG_DIR = path.resolve(import.meta.dirname, "..");
+const REPO_ROOT = path.resolve(PKG_DIR, "..", "..");
+const GIT_SHA = (() => {
+  try {
+    const sha = execSync("git rev-parse HEAD", { cwd: REPO_ROOT }).toString().trim();
+    const dirty = execSync("git status --porcelain", { cwd: REPO_ROOT }).toString().trim() ? "-dirty" : "";
+    return sha + dirty;
+  } catch {
+    return "unknown";
+  }
+})();
 const STATE_DIR = await mkdtemp(path.join(tmpdir(), "raftd-e2e-"));
 const REPORT = path.join(PKG_DIR, "e2e", "report.md");
 
 type Check = { phase: string; name: string; ok: boolean; detail: string };
 const checks: Check[] = [];
+const skipped: { phase: string; name: string; reason: string }[] = [];
 
 // No model key → the run used to die 13 checks in and leave the PREVIOUS
 // green report.md standing. Stamp the report immediately, then bail.
@@ -76,6 +90,10 @@ function check(name: string, ok: boolean, detail = ""): boolean {
   checks.push({ phase: currentPhase, name, ok, detail });
   console.log(`${ok ? "  ✓" : "  ✗"} ${name}${detail ? ` — ${detail}` : ""}`);
   return ok;
+}
+function skip(name: string, reason: string): void {
+  skipped.push({ phase: currentPhase, name, reason });
+  console.log(`  ⊘ ${name} — SKIPPED: ${reason}`);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -874,6 +892,7 @@ async function phaseN(stateDir: string) {
   // concurrent acquires — exactly one winner or the mutex protocol leaked.
   let multi = 0;
   let maxWinners = 0;
+  let badRounds = 0;
   for (let round = 0; round < 40; round++) {
     const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-stale-"));
     await writeFile(path.join(dir, "raftd.lock"), JSON.stringify({
@@ -882,11 +901,12 @@ async function phaseN(stateDir: string) {
     const results = await Promise.allSettled([...Array(32)].map(() => MachineLock.acquire(dir)));
     const won = results.filter((r) => r.status === "fulfilled");
     maxWinners = Math.max(maxWinners, won.length);
+    if (won.length !== 1) badRounds++; // EVERY round must yield exactly one
     if (won.length > 1) multi++;
     for (const w of won) await (w as PromiseFulfilledResult<MachineLock>).value.release();
     await rm(dir, { recursive: true, force: true });
   }
-  check("stale-lock takeover: exactly one winner per round", multi === 0 && maxWinners === 1, `max=${maxWinners} multi=${multi}`);
+  check("stale-lock takeover: exactly one winner every round", badRounds === 0, `badRounds=${badRounds} max=${maxWinners}`);
 
   // Orphan reaping is ledger-based, not cwd-based: a recorded child is
   // killed even after cd'ing elsewhere; an unrecorded process sitting in
@@ -974,6 +994,295 @@ async function phaseN(stateDir: string) {
     await rm(path.join(stateDir, "raftd.port"), { force: true });
   } else {
     srvN.kill("SIGKILL");
+  }
+}
+
+async function phaseO(stateDir: string): Promise<void> {
+  phase("O — issue-#2 round-3 regressions (scheduling boundaries)");
+  const linux = process.platform === "linux";
+  const E2E_DIR = path.join(PKG_DIR, "e2e");
+
+  // ── O1: a LIVE (SIGSTOP'd) takeover-mutex holder is never reaped ─────
+  // A separate OS process claims the mutex (mkdir + owner.json identity),
+  // gets SIGSTOPped mid-ownership, and the dir is aged past the stale
+  // threshold. A paused holder still owns — the mutex must survive and the
+  // pending acquire must only complete after the holder actually dies.
+  if (!linux) {
+    skip("live mutex holder SIGSTOP", "linux-only (/proc state, signals)");
+  } else {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-mutex-"));
+    await writeFile(path.join(dir, "raftd.lock"), JSON.stringify({
+      pid: 2147483647, token: "dead", startedAt: "2000-01-01T00:00:00Z",
+    }) + "\n");
+    const mutexDir = path.join(dir, "raftd.lock.takeover");
+    const holder = spawn(process.execPath, [path.join(E2E_DIR, "lock-mutex-holder.mjs"), mutexDir], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let holderOut = "";
+    holder.stdout.on("data", (d) => (holderOut += String(d)));
+    holder.stderr.on("data", (d) => (holderOut += String(d)));
+    const claimed = await waitFor("mutex holder claimed", () => existsSync(path.join(mutexDir, "owner.json")), 15_000, 100);
+    check("takeover mutex claimed by separate process", claimed, holderOut.trim().slice(0, 80));
+    if (claimed) {
+      process.kill(holder.pid!, "SIGSTOP");
+      await sleep(400);
+      const st = procInfo(holder.pid!)?.state;
+      check("holder actually stopped", st === "T", `state=${st}`);
+      const old = new Date(Date.now() - 61_000);
+      await utimes(mutexDir, old, old); // past the stale-mtime fallback
+      let settledRes = "pending";
+      const acq = MachineLock.acquire(dir);
+      acq.then(() => { settledRes = "acquired"; })
+        .catch((e) => { settledRes = `err:${e instanceof Error ? e.message : e}`; });
+      await sleep(2_500);
+      check(
+        "live stopped holder's mutex not broken (acquire still pending, dir intact)",
+        settledRes === "pending" && existsSync(path.join(mutexDir, "owner.json")),
+        `acq=${settledRes} dir=${existsSync(mutexDir)}`,
+      );
+      process.kill(holder.pid!, "SIGCONT");
+      holder.kill("SIGKILL");
+      const completed = await waitFor("pending acquire completes after holder death", () => settledRes !== "pending", 30_000, 200);
+      check("acquire completes once the holder is dead", completed && settledRes === "acquired", `res=${settledRes}`);
+      const won = await acq.catch(() => null);
+      await won?.release();
+    }
+    await waitExit(holder);
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  // ── O2: zombie lock owner is dead, not locked ─────────────────────────
+  // A parent that never wait()s leaves the killed lock holder in Z state;
+  // kill(pid,0) still succeeds on zombies, so /proc state must drive the
+  // liveness call. Fixture: e2e/zombie-owner.py.
+  const hasPy = spawnSync("python3", ["-V"], { stdio: "pipe" }).status === 0;
+  if (!linux || !hasPy) {
+    skip("zombie lock owner", linux ? "python3 unavailable" : "linux-only");
+  } else {
+    const dir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-zom-"));
+    const zp = spawn("python3", [path.join(E2E_DIR, "zombie-owner.py"), dir], { stdio: ["pipe", "pipe", "pipe"] });
+    let zomOut = "";
+    zp.stdout.on("data", (d) => (zomOut += String(d)));
+    zp.stderr.on("data", (d) => (zomOut += String(d)));
+    const ready = await waitFor("zombie owner ready", () => zomOut.includes("READY"), 60_000, 200);
+    const zPid = Number(/pid=(\d+)/.exec(zomOut)?.[1]);
+    check("zombie owner fixture up (Z state)", ready && procInfo(zPid)?.state === "Z", zomOut.trim().slice(0, 100));
+    if (ready) {
+      const lock = await MachineLock.acquire(dir).catch(() => null);
+      check("zombie-owned lock taken over", lock !== null);
+      await lock?.release();
+    }
+    zp.stdin.end();
+    await waitExit(zp);
+    await rm(dir, { recursive: true, force: true });
+  }
+
+  // ── O3: real tool spawn → leader exits, background group reaped ──────
+  // The REAL exec path (NodeExecutionEnv + the daemon's own
+  // trackToolChildren hook) spawns `(sleep N; write file) &` — the ledger
+  // pid exits while the delayed write is still armed. daemon.open() must
+  // kill the whole group, and the file must never materialize.
+  if (!linux) {
+    skip("background-descendant group reaping", "linux-only (/proc groups)");
+  } else {
+    const odir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-orphan-"));
+    const { NodeExecutionEnv } = await import("@earendil-works/pi-durable/env/node");
+    const env = new NodeExecutionEnv({ cwd: odir });
+    trackToolChildren(env, odir); // the daemon's own ledger hook
+    const bgPidFile = path.join(odir, "bgpid.txt");
+    const sideEffect = path.join(odir, "background.txt");
+    // Subshell stdio → /dev/null so env.exec resolves on the leader's exit
+    // instead of waiting for the orphaned pipes to close.
+    await env.exec(`(sleep 5; printf orphan-finished > ${sideEffect}) >/dev/null 2>&1 & echo $! > ${bgPidFile}; exit 0`, {}, BACKGROUND_CONTEXT);
+    const wrotePid = await waitFor("background pid recorded", () => existsSync(bgPidFile), 10_000, 100);
+    const bgPid = wrotePid ? Number((await readFile(bgPidFile, "utf8")).trim()) : 0;
+    const bgAlive = () => {
+      const i = procInfo(bgPid);
+      return i !== undefined && !["Z", "X", "x"].includes(i.state);
+    };
+    check("background descendant outlived its ledger leader", wrotePid && bgAlive(), `bgpid=${bgPid}`);
+    const dO = await DurableDaemon.open({ stateDir: odir, providers: [] });
+    await sleep(400);
+    check("dead-leader group reaped on open", wrotePid && !bgAlive());
+    await dO.close();
+    await sleep(5_500);
+    check("delayed side-effect never landed", !existsSync(sideEffect));
+    await rm(odir, { recursive: true, force: true }).catch(() => {});
+
+    // Ledger edge cases: a stale-start line for a live pid must not consume
+    // it (a later valid line still reaps); a {pid}-only line has no identity
+    // and must never kill.
+    const stray = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    stray.unref();
+    await sleep(300);
+    const strayDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-led-"));
+    await writeFile(path.join(strayDir, "tool-children.jsonl"),
+      JSON.stringify({ pid: stray.pid, start: "0" }) + "\n" +
+      JSON.stringify({ pid: stray.pid, start: processStartTime(stray.pid!) }) + "\n");
+    const dS = await DurableDaemon.open({ stateDir: strayDir, providers: [] });
+    await sleep(400);
+    check("pid-reuse history: later valid entry still reaps", procInfo(stray.pid!) === undefined || DEAD_STATES.has(procInfo(stray.pid!)!.state));
+    await dS.close();
+    stray.kill("SIGKILL");
+    await rm(strayDir, { recursive: true, force: true }).catch(() => {});
+
+    const ghost = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    ghost.unref();
+    await sleep(300);
+    const ghostDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-ghost-"));
+    await writeFile(path.join(ghostDir, "tool-children.jsonl"), JSON.stringify({ pid: ghost.pid }) + "\n");
+    const dG = await DurableDaemon.open({ stateDir: ghostDir, providers: [] });
+    await sleep(400);
+    const gInfo = procInfo(ghost.pid!);
+    check("ledger entry without start never kills", gInfo !== undefined && !DEAD_STATES.has(gInfo.state));
+    await dG.close();
+    ghost.kill("SIGKILL");
+    await rm(ghostDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // ── O4: legacy DB with a truly lost projection is rebuilt ────────────
+  // Fixture = durable truth (settled submission + delivered outcome frame)
+  // with the projection surgically absent — what a real old-version crash
+  // between outcome commit and registry projection leaves on disk.
+  const dLost = await DurableDaemon.open({ stateDir, providers: [] });
+  const { record: lost } = await dLost.createAgent({ name: "lostproj", model: MODEL });
+  const { record: kept } = await dLost.createAgent({ name: "keptproj", model: MODEL });
+  await dLost.postMessage(lost.agentId, "hello");
+  await dLost.postMessage(kept.agentId, "hello");
+  const both = await waitFor("both legacy submissions settle", async () => {
+    const rs = await dLost.listAgents();
+    return [lost.agentId, kept.agentId].every((id) => {
+      const r = rs.find((a) => a.agentId === id);
+      return ((r?.runs ?? 0) + (r?.failures ?? 0)) >= 1;
+    });
+  }, 60_000, 500);
+  check("two legacy submissions settled", both);
+  // The projected record IS the truth — capture it before destroying it.
+  const beforeLost = (await dLost.listAgents()).find((a) => a.agentId === lost.agentId);
+  const beforeKept = (await dLost.listAgents()).find((a) => a.agentId === kept.agentId);
+  await dLost.harness.commit(async (tx) => {
+    const doc = await tx.doc(AgentsDoc);
+    const rl = doc.records[lost.agentId];
+    if (rl) {
+      rl.runs = 0; rl.failures = 0; rl.lastOutcome = null; rl.terminalFailure = null;
+      delete (rl as { projectedSubmissions?: string[] }).projectedSubmissions;
+    }
+    const rk = doc.records[kept.agentId];
+    if (rk) delete (rk as { projectedSubmissions?: string[] }).projectedSubmissions;
+  }, BACKGROUND_CONTEXT);
+  await dLost.close();
+  const dLost2 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLost2.resume();
+  await sleep(500);
+  const rLost = (await dLost2.listAgents()).find((a) => a.agentId === lost.agentId);
+  const rKept = (await dLost2.listAgents()).find((a) => a.agentId === kept.agentId);
+  check(
+    "lost projection rebuilt to the true counters (runs/failures/lastOutcome)",
+    rLost?.runs === beforeLost?.runs &&
+      rLost?.failures === beforeLost?.failures &&
+      rLost?.lastOutcome?.status === beforeLost?.lastOutcome?.status &&
+      rLost?.lastOutcome !== undefined,
+    `runs=${rLost?.runs}/${beforeLost?.runs} failures=${rLost?.failures}/${beforeLost?.failures} last=${rLost?.lastOutcome?.status ?? "null"}`,
+  );
+  check(
+    "already-projected record lands identical counters on rebuild",
+    rKept?.runs === beforeKept?.runs && rKept?.failures === beforeKept?.failures,
+    `runs=${rKept?.runs}/${beforeKept?.runs} failures=${rKept?.failures}/${beforeKept?.failures}`,
+  );
+  await dLost2.close();
+  const dLost3 = await DurableDaemon.open({ stateDir, providers: [] });
+  await dLost3.resume();
+  await sleep(500);
+  const rLost3 = (await dLost3.listAgents()).find((a) => a.agentId === lost.agentId);
+  check("rebuild is idempotent across resumes", (rLost3?.runs ?? 0) + (rLost3?.failures ?? 0) === 1, `runs=${rLost3?.runs} failures=${rLost3?.failures}`);
+  await dLost3.close();
+
+  // ── O5: wrapper — concurrent requests share one bring-up; thin CLI ───
+  let PY = "";
+  for (const cand of ["/tmp/wtest/venv/bin/python3", "python3"]) {
+    if (spawnSync(cand, ["-c", "import fastapi,uvicorn,httpx"], { stdio: "pipe" }).status === 0) {
+      PY = cand;
+      break;
+    }
+  }
+  if (!PY) {
+    skip("wrapper shared readiness + thin CLI", "no python with fastapi/uvicorn/httpx (pip install -r deploy/requirements.txt)");
+  } else {
+    const wstate = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wstate-"));
+    const wdata = await mkdtemp(path.join(tmpdir(), "raftd-e2e-wdata-"));
+    const pubPort = await freePort();
+    const childPort = await freePort();
+    const wrap = spawn(PY, ["-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", String(pubPort)], {
+      cwd: path.join(REPO_ROOT, "deploy"),
+      env: {
+        ...process.env,
+        RAFTD_STATE: wstate, RAFTD_DATA: wdata, RAFTD_REPO: REPO_ROOT,
+        RAFTD_CHILD_PORT: String(childPort), PORT: String(pubPort),
+        RAFTD_KEY: "e2ekey", NODE_BIN: process.execPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let wOut = "";
+    wrap.stdout.on("data", (d) => (wOut += String(d)));
+    wrap.stderr.on("data", (d) => (wOut += String(d)));
+    const up = await waitFor("wrapper healthy", async () =>
+      (await fetch(`http://127.0.0.1:${pubPort}/healthz`).catch(() => null))?.ok ?? false, 90_000, 500);
+    check("wrapper up with child", up, wOut.trim().slice(-120));
+    if (up) {
+      // SIGKILL the real child, then hammer: every waiter must share ONE
+      // bring-up — no live-pid-without-listen false positives.
+      let childPid = 0;
+      try {
+        childPid = Number(execSync(`pgrep -f "cli.ts serve --state ${wstate}"`).toString().trim().split("\n")[0]);
+      } catch { /* lookup failed */ }
+      check("wrapper child located for SIGKILL", childPid > 0);
+      if (childPid > 0) process.kill(childPid, "SIGKILL");
+      await sleep(400);
+      const codes = await Promise.all(
+        [...Array(16)].map(() =>
+          fetch(`http://127.0.0.1:${pubPort}/api/state`, { headers: { authorization: "Bearer e2ekey" } })
+            .then((r) => r.status).catch(() => -1),
+        ),
+      );
+      const ok200 = codes.filter((c) => c === 200).length;
+      check("16 concurrent post-crash requests all 200 (shared readiness)", ok200 === 16, JSON.stringify(codes));
+      const cli = await runCli(wstate, ["list"], { RAFTD_KEY: "e2ekey" });
+      check("thin CLI works through published public port", cli.code === 0, cli.out.trim().slice(0, 80));
+    }
+    wrap.kill("SIGTERM");
+    await waitExit(wrap, 15_000);
+    await rm(wstate, { recursive: true, force: true }).catch(() => {});
+    await rm(wdata, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // ── O6: real Docker build + run (when a daemon is available) ─────────
+  const dockerOk = spawnSync("docker", ["info"], { stdio: "pipe", timeout: 20_000 }).status === 0;
+  if (!dockerOk) {
+    skip("docker build + run matrix", "docker daemon unavailable");
+  } else {
+    const tag = `raftd-e2e:${GIT_SHA.slice(0, 12)}`;
+    const b = spawnSync("docker", ["build", "-f", "deploy/Dockerfile", "-t", tag, "."], { cwd: REPO_ROOT, stdio: "pipe", timeout: 900_000 });
+    check("docker image builds from root context", b.status === 0, b.stderr?.toString().slice(-200) ?? "");
+    if (b.status === 0) {
+      const pubPort = await freePort();
+      const name = `raftd-e2e-${Math.random().toString(36).slice(2, 8)}`;
+      spawnSync("docker", ["run", "-d", "--name", name, "-e", "RAFTD_KEY=e2ekey", "-e", "PORT=8080", "-p", `${pubPort}:8080`, tag], { stdio: "pipe", timeout: 60_000 });
+      const up = await waitFor("container healthy", async () =>
+        (await fetch(`http://127.0.0.1:${pubPort}/healthz`).catch(() => null))?.ok ?? false, 120_000, 1_000);
+      check("container healthy", up);
+      if (up) {
+        const st = await fetch(`http://127.0.0.1:${pubPort}/api/state`, { headers: { authorization: "Bearer e2ekey" } }).then((r) => r.status).catch(() => -1);
+        check("authed /api/state in container", st === 200, `status=${st}`);
+        const hash = spawnSync("docker", ["exec", name, "sha256sum", "/raftbuild-durable/packages/agent/src/machineLock.ts"], { stdio: "pipe", timeout: 30_000 });
+        const localHash = spawnSync("sha256sum", [path.join(PKG_DIR, "src", "machineLock.ts")], { stdio: "pipe" });
+        const imgHash = hash.stdout?.toString().split(" ")[0];
+        const srcHash = localHash.stdout?.toString().split(" ")[0];
+        check("image source matches this commit", imgHash === srcHash, `img=${imgHash} src=${srcHash}`);
+        const cli = spawnSync("docker", ["exec", "-e", "RAFTD_KEY=e2ekey", name, "node", "--experimental-transform-types", "/raftbuild-durable/packages/agent/src/cli.ts", "list", "--state", "/data/.raftd"], { stdio: "pipe", timeout: 60_000 });
+        check("thin CLI inside container via public key", cli.status === 0, cli.stderr?.toString().slice(-120) ?? "");
+      }
+      spawnSync("docker", ["rm", "-f", name], { stdio: "pipe", timeout: 30_000 });
+    }
   }
 }
 
@@ -1068,6 +1377,7 @@ try {
   await phaseL(STATE_DIR);
   await phaseM(STATE_DIR);
   await phaseN(STATE_DIR);
+  await phaseO(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));
@@ -1079,13 +1389,17 @@ const failed = checks.filter((c) => !c.ok);
 const report = [
   `# E2E report — raftbuild-durable`,
   ``,
-  `stateDir: \`${STATE_DIR}\`  model: ${MODEL.provider}/${MODEL.modelId}  duration: ${((Date.now() - t0) / 1000).toFixed(0)}s`,
+  `commit: \`${GIT_SHA}\`  node: ${process.version}  model: ${MODEL.provider}/${MODEL.modelId}  duration: ${((Date.now() - t0) / 1000).toFixed(0)}s`,
+  `stateDir: \`${STATE_DIR}\``,
   ``,
+  ...(skipped.length > 0
+    ? [`## Skipped (not counted as pass)`, ``, ...skipped.map((s) => `- **${s.phase}** ${s.name}: ${s.reason}`), ``]
+    : []),
   `| phase | check | result | detail |`,
   `|---|---|---|---|`,
   ...checks.map((c) => `| ${c.phase} | ${c.name} | ${c.ok ? "PASS" : "FAIL"} | ${c.detail.replace(/\|/g, "\\|").replace(/\n/g, " ")} |`),
   ``,
-  `${checks.length - failed.length}/${checks.length} checks passed.`,
+  `${checks.length - failed.length}/${checks.length} checks passed; ${skipped.length} skipped.`,
 ].join("\n");
 await mkdir(path.dirname(REPORT), { recursive: true });
 await writeFile(REPORT, report);

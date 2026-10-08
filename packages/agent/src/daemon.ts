@@ -7,8 +7,8 @@
  * "Daemon" here is a lifetime, not a process: `open()` on an existing state
  * dir IS the restart — unfinished work resumes via `harness.resume()`.
  */
-import { mkdir, appendFile, rm, readdir, readFile } from "node:fs/promises";
-import { appendFileSync, existsSync } from "node:fs";
+import { mkdir, appendFile, rm, readdir, readFile, stat } from "node:fs/promises";
+import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -51,7 +51,7 @@ import {
   type WorkspaceDirectoryInfo,
 } from "./workspaces.ts";
 import { DurableEventNormalizer } from "./events.ts";
-import { processStartTime } from "./machineLock.ts";
+import { DEAD_STATES, procInfo, processStartTime } from "./machineLock.ts";
 import { AgentOutbox, OutboxDoc, OutboxError } from "./outbox.ts";
 import { JsonlDeliveryTransport, type OutboxTransport } from "./transport.ts";
 import { terminalFailureFromRawText, turnCompletedOutcome } from "./outcome.ts";
@@ -1092,21 +1092,52 @@ export class DurableDaemon {
       }
     }
     // Legacy migration: records written before the projection ledger have no
-    // projectedSubmissions field, and their outcomes were ALREADY counted
-    // (runs/failures/lastOutcome) by the old produce path. Blindly replaying
-    // them through the repair path would double-count every upgrade. Seed
-    // the ledger with all settled ids up front — a submission whose frame
-    // was never committed still repairs via outbox dedupe, only the
-    // counter-skip is a conscious trade-off (documented in NOTES).
+    // projectedSubmissions field. We cannot tell which settled submissions
+    // the old code already projected — and a real old-version crash can have
+    // left "frame delivered, projection lost". So REBUILD instead of
+    // increment: recompute runs/failures/lastOutcome/terminalFailure from the
+    // durable submissions themselves. An already-projected upgrade lands the
+    // same numbers; a lost projection is repaired. The repair loop below then
+    // only fills in missing outcome FRAMES (dedupe by submissionId).
     if (record.projectedSubmissions === undefined && settled.length > 0) {
-      const ids = settled.map((s) => s.id);
       await this.harness
         .commit(async (tx: Tx) => {
           const doc = await tx.doc(AgentsDoc);
           const r = doc.records[record.agentId];
-          if (r && r.projectedSubmissions === undefined) {
-            r.projectedSubmissions = ids.slice(-4096);
+          if (!r || r.projectedSubmissions !== undefined) return;
+          let runs = 0;
+          let failures = 0;
+          let latest: (typeof settled)[number] | undefined;
+          for (const s of settled) {
+            if (s.status === "done") runs++;
+            else failures++;
+            if (latest === undefined || Number(s.id) >= Number(latest.id)) latest = s;
           }
+          r.runs = runs;
+          r.failures = failures;
+          if (latest !== undefined) {
+            const done = latest.status === "done";
+            const evidence = done
+              ? undefined
+              : terminalFailureFromRawText(failureKindFor(latest.reason), latest.reason ?? "unanswered");
+            r.lastOutcome = {
+              kind: done ? "turn_completed" : "terminal_failure",
+              status: latest.status,
+              submissionId: latest.id,
+              reason: done ? null : (latest.reason ?? "unanswered"),
+              errorClass: evidence?.errorClass ?? null,
+              at: new Date().toISOString(),
+            };
+            if (evidence !== undefined && evidence.errorAction !== null && evidence.errorAction !== "none") {
+              r.terminalFailure = {
+                failureKind: evidence.failureKind,
+                fingerprint: evidence.fingerprint,
+                detail: evidence.detail ?? latest.reason ?? "terminal failure",
+                at: new Date().toISOString(),
+              };
+            }
+          }
+          r.projectedSubmissions = settled.map((s) => s.id).slice(-4096);
         }, BACKGROUND_CONTEXT)
         .catch(() => {});
     }
@@ -1179,7 +1210,7 @@ function pickDefaultModel(providers: readonly Provider[]): AgentModelRef | undef
  */
 const TOOL_CHILDREN_FILE = "tool-children.jsonl";
 
-function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void {
+export function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void {
   // NodeExecutionEnv keeps a private Set<number> of live child pids, added
   // the moment spawn() returns — wrap add() so every spawn is journaled
   // (sync append; spawn bookkeeping cannot await).
@@ -1198,16 +1229,52 @@ function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void {
   };
 }
 
+/** Seconds since boot at which the kernel started (/proc/stat btime). */
+function bootTime(): number | undefined {
+  try {
+    const m = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
+    return m === null ? undefined : Number(m[1]);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Live (non-zombie) processes whose process group equals `pgid`. */
+function liveGroupMembers(pgid: number): { pid: number; startJiffies: number }[] {
+  const out: { pid: number; startJiffies: number }[] = [];
+  try {
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      const info = procInfo(pid);
+      if (info === undefined || DEAD_STATES.has(info.state) || info.pgrp !== pgid) continue;
+      out.push({ pid, startJiffies: Number(info.start) });
+    }
+  } catch {
+    /* /proc unavailable */
+  }
+  return out;
+}
+
 async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
   const file = path.join(stateDir, TOOL_CHILDREN_FILE);
   let raw: string;
+  let ledgerEndJiffies = Number.POSITIVE_INFINITY;
   try {
+    const st = await stat(file);
     raw = await readFile(file, "utf8");
+    // Upper bound for "descendant started while the dead host lived": the
+    // ledger was last appended before the host died, so no legitimate tool
+    // descendant can have started after it (jiffies = (mtime-boot)*USER_HZ).
+    const boot = bootTime();
+    if (boot !== undefined) {
+      ledgerEndJiffies = (st.mtimeMs / 1000 - boot) * 100 + 500; // USER_HZ=100, 5s grace
+    }
   } catch {
     return 0; // no ledger → nothing this daemon's lineage ever spawned
   }
   let reaped = 0;
-  const seen = new Set<number>();
+  const done = new Set<number>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let pid: number | undefined;
@@ -1219,23 +1286,48 @@ async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
     } catch {
       continue;
     }
-    if (typeof pid !== "number" || pid <= 1 || pid === process.pid || seen.has(pid)) continue;
-    seen.add(pid);
-    // Alive check + pid-reuse check in one: the recorded kernel starttime
-    // must match the process currently owning this pid.
-    const now = processStartTime(pid);
-    if (now === undefined || (start !== undefined && now !== start)) continue;
-    try {
-      process.kill(-pid, "SIGKILL"); // detached child = process-group leader
-      reaped++;
-    } catch {
+    if (typeof pid !== "number" || pid <= 1 || pid === process.pid || done.has(pid)) continue;
+    const info = procInfo(pid);
+    if (info !== undefined && !DEAD_STATES.has(info.state)) {
+      if (start !== undefined && info.start === start) {
+        // Recorded leader still alive, identity proven → kill its group.
+        try {
+          process.kill(-pid, "SIGKILL"); // detached child = process-group leader
+          reaped++;
+        } catch {
+          try {
+            process.kill(pid, "SIGKILL");
+            reaped++;
+          } catch {
+            /* gone */
+          }
+        }
+        done.add(pid);
+      }
+      // Alive but start missing/mismatched → pid was RECYCLED by someone
+      // else's process — never touch it, and don't consume the pid either:
+      // a later ledger line may carry the real start for this pid.
+      continue;
+    }
+    // Leader dead/zombie — descendants may still run in pgrp === pid. A
+    // process group id only survives while members exist, and no new process
+    // can join a dead pid's group, so members here are descendants of the
+    // recorded leader — bounded to [leaderStart, ledgerEnd] to stay safe
+    // against a fully recycled pid+pgid.
+    if (start === undefined) continue; // no identity — conservative skip
+    const leaderJ = Number(start);
+    const members = liveGroupMembers(pid).filter((m) => m.pid !== pid);
+    if (members.length === 0) continue;
+    if (members.every((m) => m.startJiffies >= leaderJ && m.startJiffies <= ledgerEndJiffies)) {
       try {
-        process.kill(pid, "SIGKILL");
+        process.kill(-pid, "SIGKILL");
         reaped++;
+        done.add(pid);
       } catch {
-        /* gone */
+        /* group already gone */
       }
     }
+    // Any member outside the window → ambiguous ownership → leave it alone.
   }
   // The ledger describes the previous lifetime — consumed once reaped.
   await rm(file, { force: true });
