@@ -328,6 +328,9 @@ async function main(): Promise<number> {
       }
       case "serve": {
         const lock = await MachineLock.acquire(daemon.stateDir);
+        // Reap a previous host's orphans only after the lock proves we're
+        // the owner — inside open() this would kill a live daemon's tools.
+        await daemon.reapOrphanedToolChildren();
         const reminders = new ReminderService(daemon);
         await daemon.resume();
         await reminders.start();

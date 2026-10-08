@@ -44,7 +44,7 @@ raftd CLI → 同一份 stateDir
 3. **不造 runtime**。只 pi+pi-ai；别的 CLI 结构性降级，不做。
 4. **Web 控制台单文件 HTML**，serve 内嵌，零构建依赖。
 5. **提醒 = durable timers doc + 重启重装 setTimeout**。不引入 cron 依赖。
-6. **machineLock 抄语义**：锁文件 {pid, token, startedAt}，活锁拒绝，死锁接管。
+6. **machineLock 抄语义**：锁文件 {pid, token, startedAt, pidStart}，活锁拒绝，死锁接管（接管互斥目录有 owner.json 身份，活持有者——含被 SIGSTOP 冻结的——永不被强占）。
 7. **cold-idle → compact**：空闲超时调 pi-durable compaction（若有 API）；
    没有就冻结 pump，保留 e2e 可验的简单行为。
 8. 不做：多机接管/迁移、server 集群、自升级、外部 CLI runtime。

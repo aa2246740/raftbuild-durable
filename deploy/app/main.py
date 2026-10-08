@@ -154,9 +154,16 @@ def _publish_port() -> None:
 
 
 async def _bring_up() -> bool:
+    """Spawn + wait for readiness. ANY failure (spawn error, child died,
+    readiness timeout) returns False so callers refuse with an explicit
+    503 — an exception here must never escape as a 500."""
     global _child_ready
-    _spawn()
-    ok = await _wait_ready()
+    try:
+        _spawn()
+        ok = await _wait_ready()
+    except Exception:
+        _child_ready = False
+        return False
     _child_ready = ok
     if ok:
         _publish_port()

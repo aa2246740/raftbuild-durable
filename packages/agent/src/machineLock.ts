@@ -111,10 +111,24 @@ async function reapMutexDirIfDead(dir: string): Promise<boolean> {
   }
   if (owner !== null && typeof owner.pid === "number") {
     if (ownerAlive(owner)) return false;
+    // Re-verify in the last instant before rm: the dir at this path may have
+    // been reaped and recreated since our stat — deleting by path would then
+    // remove someone else's LIVE mutex. Same inode + owner still dead = the
+    // dir we judged is still the dir we delete.
+    const now = await stat(dir).catch(() => null);
+    if (now === null || now.ino !== st.ino) return false;
+    try {
+      const fresh = JSON.parse(await readFile(path.join(dir, TAKEOVER_OWNER_FILE), "utf8")) as LockOwner;
+      if (typeof fresh.pid !== "number" || ownerAlive(fresh)) return false;
+    } catch {
+      return false; // owner file vanished or turned unreadable — don't rm
+    }
     await rm(dir, { recursive: true, force: true });
     return true;
   }
   if (Date.now() - st.mtimeMs > 30_000) {
+    const now = await stat(dir).catch(() => null);
+    if (now === null || now.ino !== st.ino) return false;
     await rm(dir, { recursive: true, force: true });
     return true;
   }
@@ -151,7 +165,12 @@ async function withTakeoverMutex<T>(dir: string, fn: () => Promise<T>): Promise<
     try {
       await writeFile(
         path.join(dir, TAKEOVER_OWNER_FILE),
-        JSON.stringify({ pid: process.pid, token, pidStart: processStartTime(process.pid) }),
+        JSON.stringify({
+          pid: process.pid,
+          token,
+          startedAt: new Date().toISOString(),
+          pidStart: processStartTime(process.pid),
+        } satisfies LockOwner),
       );
     } catch {
       continue; // dir vanished underneath us — recreate next round

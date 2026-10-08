@@ -132,8 +132,9 @@ GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/1
 | 发现 | 修法 |
 |---|---|
 | stale-lock 接管仍在 inspect→replace 窗口竞态 | 换协议：`<lock>.takeover/` mkdir 原子互斥，临界区内重新 inspect（inode 变化=让位），删锁改 unlink，link() 仍是唯一创建通道。32并发×60轮实测单持有者 |
-| 孤儿清理误杀/漏杀（cwd 归属） | 台账制：`activeChildPids.add` 挂钩在 spawn 时记 {pid,内核starttime} 到 `tool-children.jsonl`；open() 只杀台账中 starttime 匹配的存活 pid（整组 SIGKILL）。不杀陌生人的进程，也不怕工具 cd 走 |
-| 升级旧状态 outcome 重复计数 | legacy 迁移：`projectedSubmissions === undefined` 的 record，reconcile 先把全部 settled submission id 播种进台账再跑修复循环（不重新计数；frame 未提交者仍经 outbox dedupe 补投） |
+| 孤儿清理误杀/漏杀（cwd 归属） | 台账制：`activeChildPids.add` 挂钩在 spawn 时记 {pid,内核starttime} 到 `tool-children.jsonl`（三轮改为 `serve` 拿锁后收割，见下表） |
+| 升级旧状态 outcome 重复计数 | legacy 迁移：`projectedSubmissions === undefined` 的 record 由 reconcile 重建（三轮改为从 settled submissions 重算 counters/lastOutcome/terminalFailure，见下表） |
+
 | whenBusy=reject 返回 500 | statusFor 正则放宽 `\bis busy\b`（"Conversation 2 is busy" 带 id 不再漏）→409 |
 | 390px 输入栏溢出 | composer `flex-wrap` + input `order:-1 flex:1 1 100%`，窄屏两行排列 |
 | wrapper 代理全 500 | httpx 0.28 没有 `request(stream=)` → `build_request`+`send(stream=True)`；响应生命周期交给 `StreamingResponse(background=BackgroundTask(aclose))`，去掉非法 `async with` |
@@ -141,3 +142,15 @@ GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/1
 | SIGTERM 杀 child 但父不退 | 删自定义 signal handler，child 清理挪进 FastAPI lifespan shutdown，uvicorn 退出链路完整 |
 | Docker 打包过期 daemon | 删 tracked `repo.tar.gz`；Dockerfile 改从仓库根 COPY 当前源码构建；fly.toml 移到根 + `dockerfile=deploy/Dockerfile`；加 `.dockerignore` |
 | wrapper 升级丢旧配置/query-key | `_load_envfile()` 合并 `STATE/child.env`→`DATA/.env`（旧 key 保留）；setup 端点恢复接受 `?key=` |
+
+## issue #2 三轮复测修复（PR #3 追加）
+
+| 发现 | 修法 |
+|---|---|
+| takeover 互斥 30s-mtime 强拆会杀掉被 SIGSTOP 冻结的活持有者 | `owner.json` 身份文件：{pid, token, startedAt, pidStart}；owner 活（含 T 态）→ 永不收割；死/僵死/pid 复用 → 立即收割；无 owner 文件才退回 30s mtime；rm 前复查 inode+owner（防收割-重建 TOCTOU） |
+| 台账漏掉 leader 死后的后台进程组、pid 复用历史、缺 start 行误杀 | leader 死 → 枚举 pgrp=pid 的全部存活成员整组 SIGKILL（成员启动时间须 ≥ leader 启动时间——复核后删掉了会系统性漏杀的上界）；pid 复用不消费；缺 start 保守跳过 |
+| 二次 `serve`/`open` 会在拿锁前收割活 daemon 的子进程 | 收割移出 `open()`：`serve` 在 `MachineLock.acquire` 之后才跑 `reapOrphanedToolChildren()`；一次性命令永不收割 |
+| 老库丢投影被祖父条款掩盖 | 不再跳过：从 durable settled submissions 重建 runs/failures/lastOutcome/terminalFailure，幂等 |
+| zombie 锁主被 kill(0) 判活 | `processAlive` 先读 /proc state（Z/X/x=死），无 /proc 才退回 kill(0)/EPERM |
+| wrapper 崩溃后并发首请求 15/16×502 | `_ensure_up()` 共享 bring-up 任务，所有请求等同一个；硬拒绝显式 503（`_bring_up` 异常也归一为 False） |
+| 薄 CLI 在 wrapper/Docker 里 401 | `raftd.port` 写公网入口 `127.0.0.1:$PORT`；子进程端口另存 `raftd.internal-port` |

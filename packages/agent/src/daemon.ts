@@ -200,11 +200,6 @@ export class DurableDaemon {
     registry.install(RaftAgentExtension);
     registry.install(MessagingExtension);
 
-    const orphans = await reapOrphanedToolChildren(stateDir);
-    if (orphans > 0) {
-      console.error(`[daemon] reaped ${orphans} orphaned tool process(es) left by a previous host (SIGKILL window)`);
-    }
-
     const storage = await openNodeSqliteStorage(path.join(stateDir, "session.sqlite"));
     const harness = await Harness.open(
       storage,
@@ -287,6 +282,21 @@ export class DurableDaemon {
       count += page?.items.length ?? 0;
     }
     return count;
+  }
+
+  /**
+   * Kill tool processes a PREVIOUS host left behind. Must only run while
+   * this process owns the state dir (i.e. after MachineLock.acquire in
+   * `serve`): on a live host's dir it would kill the running daemon's
+   * children, which is why open() itself never reaps — one-shot CLI opens
+   * (`send`, `list`) race a live daemon all the time.
+   */
+  async reapOrphanedToolChildren(): Promise<number> {
+    const n = await reapOrphanedToolChildren(this.stateDir);
+    if (n > 0) {
+      this.opts.onWarn?.(`reaped ${n} orphaned tool process(es) left by a previous host (SIGKILL window)`);
+    }
+    return n;
   }
 
   async close(): Promise<void> {
@@ -1229,16 +1239,6 @@ export function trackToolChildren(env: NodeExecutionEnv, stateDir: string): void
   };
 }
 
-/** Seconds since boot at which the kernel started (/proc/stat btime). */
-function bootTime(): number | undefined {
-  try {
-    const m = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
-    return m === null ? undefined : Number(m[1]);
-  } catch {
-    return undefined;
-  }
-}
-
 /** Live (non-zombie) processes whose process group equals `pgid`. */
 function liveGroupMembers(pgid: number): { pid: number; startJiffies: number }[] {
   const out: { pid: number; startJiffies: number }[] = [];
@@ -1259,17 +1259,8 @@ function liveGroupMembers(pgid: number): { pid: number; startJiffies: number }[]
 async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
   const file = path.join(stateDir, TOOL_CHILDREN_FILE);
   let raw: string;
-  let ledgerEndJiffies = Number.POSITIVE_INFINITY;
   try {
-    const st = await stat(file);
     raw = await readFile(file, "utf8");
-    // Upper bound for "descendant started while the dead host lived": the
-    // ledger was last appended before the host died, so no legitimate tool
-    // descendant can have started after it (jiffies = (mtime-boot)*USER_HZ).
-    const boot = bootTime();
-    if (boot !== undefined) {
-      ledgerEndJiffies = (st.mtimeMs / 1000 - boot) * 100 + 500; // USER_HZ=100, 5s grace
-    }
   } catch {
     return 0; // no ledger → nothing this daemon's lineage ever spawned
   }
@@ -1310,15 +1301,22 @@ async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
       continue;
     }
     // Leader dead/zombie — descendants may still run in pgrp === pid. A
-    // process group id only survives while members exist, and no new process
-    // can join a dead pid's group, so members here are descendants of the
-    // recorded leader — bounded to [leaderStart, ledgerEnd] to stay safe
-    // against a fully recycled pid+pgid.
+    // process group id only survives while members exist, and no new member
+    // can join a dead pid's group (a group id is recreated only by a
+    // setsid() from that same pid — which would need the pid alive again,
+    // in which case the start-mismatch branch above skips instead). So
+    // group members here are descendants of the recorded leader; they must
+    // only postdate the leader's own start.
+    // Residual corner (documented, astronomically rare): the pid recycled
+    // into a setsid'ing process which then ALSO died — its group shares the
+    // dead pgid and is indistinguishable from the recorded lineage. Safer
+    // than an upper time bound, which systematically spared real orphans
+    // that were forked after the ledger's last append.
     if (start === undefined) continue; // no identity — conservative skip
     const leaderJ = Number(start);
     const members = liveGroupMembers(pid).filter((m) => m.pid !== pid);
     if (members.length === 0) continue;
-    if (members.every((m) => m.startJiffies >= leaderJ && m.startJiffies <= ledgerEndJiffies)) {
+    if (members.every((m) => m.startJiffies >= leaderJ)) {
       try {
         process.kill(-pid, "SIGKILL");
         reaped++;
@@ -1327,10 +1325,9 @@ async function reapOrphanedToolChildren(stateDir: string): Promise<number> {
         /* group already gone */
       }
     }
-    // Any member outside the window → ambiguous ownership → leave it alone.
   }
   // The ledger describes the previous lifetime — consumed once reaped.
-  await rm(file, { force: true });
+  await rm(file, { force: true }).catch(() => {});
   return reaped;
 }
 

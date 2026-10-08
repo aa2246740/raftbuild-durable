@@ -929,6 +929,7 @@ async function phaseN(stateDir: string) {
     try { process.kill(pid, 0); return true; } catch { return false; }
   };
   const dOrphan = await DurableDaemon.open({ stateDir, providers: [] });
+  await dOrphan.reapOrphanedToolChildren();
   await sleep(300);
   check("ledger-recorded orphan in workspace reaped", !alive(orphanInWs.pid));
   check("ledger-recorded orphan outside workspace reaped", !alive(orphanElsewhere.pid));
@@ -1102,8 +1103,9 @@ async function phaseO(stateDir: string): Promise<void> {
     };
     check("background descendant outlived its ledger leader", wrotePid && bgAlive(), `bgpid=${bgPid}`);
     const dO = await DurableDaemon.open({ stateDir: odir, providers: [] });
+    await dO.reapOrphanedToolChildren();
     await sleep(400);
-    check("dead-leader group reaped on open", wrotePid && !bgAlive());
+    check("dead-leader group reaped", wrotePid && !bgAlive());
     await dO.close();
     await sleep(5_500);
     check("delayed side-effect never landed", !existsSync(sideEffect));
@@ -1120,6 +1122,7 @@ async function phaseO(stateDir: string): Promise<void> {
       JSON.stringify({ pid: stray.pid, start: "0" }) + "\n" +
       JSON.stringify({ pid: stray.pid, start: processStartTime(stray.pid!) }) + "\n");
     const dS = await DurableDaemon.open({ stateDir: strayDir, providers: [] });
+    await dS.reapOrphanedToolChildren();
     await sleep(400);
     check("pid-reuse history: later valid entry still reaps", procInfo(stray.pid!) === undefined || DEAD_STATES.has(procInfo(stray.pid!)!.state));
     await dS.close();
@@ -1132,12 +1135,69 @@ async function phaseO(stateDir: string): Promise<void> {
     const ghostDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-ghost-"));
     await writeFile(path.join(ghostDir, "tool-children.jsonl"), JSON.stringify({ pid: ghost.pid }) + "\n");
     const dG = await DurableDaemon.open({ stateDir: ghostDir, providers: [] });
+    await dG.reapOrphanedToolChildren();
     await sleep(400);
     const gInfo = procInfo(ghost.pid!);
     check("ledger entry without start never kills", gInfo !== undefined && !DEAD_STATES.has(gInfo.state));
     await dG.close();
     ghost.kill("SIGKILL");
     await rm(ghostDir, { recursive: true, force: true }).catch(() => {});
+
+    // Late-fork member (independent review repro): a member forked AFTER
+    // the ledger's last append is still ours — the group dies with its
+    // dead leader. `sh -c 'sleep 5; sleep 300 &'` exits as leader ~5s in,
+    // leaving a `sleep 300` member in the orphaned group.
+    const lateDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-late-"));
+    const leader = spawn("sh", ["-c", "sleep 5; sleep 300 &"], { detached: true, stdio: "ignore" });
+    leader.unref();
+    await writeFile(path.join(lateDir, "tool-children.jsonl"),
+      JSON.stringify({ pid: leader.pid, start: processStartTime(leader.pid!) }) + "\n");
+    const leaderGone = await waitFor("late-fork leader exited", () => procInfo(leader.pid!) === undefined || DEAD_STATES.has(procInfo(leader.pid!)!.state), 15_000, 200);
+    const membersBefore = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" }).stdout?.toString().trim().split("\n").filter(Boolean) ?? [];
+    const dL = await DurableDaemon.open({ stateDir: lateDir, providers: [] });
+    const nLate = await dL.reapOrphanedToolChildren();
+    await dL.close();
+    await sleep(300);
+    const membersAfter = spawnSync("pgrep", ["-g", String(leader.pid!)], { stdio: "pipe" }).stdout?.toString().trim().split("\n").filter(Boolean) ?? [];
+    check(
+      "member forked after last ledger append still reaped",
+      leaderGone && membersBefore.length > 0 && nLate === 1 && membersAfter.length === 0,
+      `leader=${leader.pid} members=${membersBefore.join(",")}→${membersAfter.join(",")} reaped=${nLate}`,
+    );
+    for (const p of membersAfter) process.kill(Number(p), "SIGKILL");
+    await rm(lateDir, { recursive: true, force: true }).catch(() => {});
+
+    // A second `serve` on a live state dir must refuse WITHOUT killing the
+    // running host's tool children (reaping runs post-lock only).
+    const serveDir = await mkdtemp(path.join(tmpdir(), "raftd-e2e-srvsafe-"));
+    const srvPort = await freePort();
+    const srv1 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", serveDir, "--port", String(srvPort)], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let srv1Out = "";
+    srv1.stdout.on("data", (d) => (srv1Out += String(d)));
+    srv1.stderr.on("data", (d) => (srv1Out += String(d)));
+    const srvUp = await waitFor("first serve up", async () =>
+      (await fetch(`http://127.0.0.1:${srvPort}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+    // Now the ledger gains an entry — as if the live daemon's tool spawned
+    // it. A second `serve` must die at the lock WITHOUT reaping it.
+    const worker = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    worker.unref();
+    await sleep(300);
+    await writeFile(path.join(serveDir, "tool-children.jsonl"),
+      JSON.stringify({ pid: worker.pid, start: processStartTime(worker.pid!) }) + "\n");
+    const second = await runCli(serveDir, ["serve", "--port", String(await freePort())]);
+    check("second serve refused", second.code !== 0, second.out.trim().slice(-60));
+    const wInfo = procInfo(worker.pid!);
+    check(
+      "refused second serve did not kill the live host's children",
+      srvUp && wInfo !== undefined && !DEAD_STATES.has(wInfo.state),
+      `serve=${srvUp} worker=${wInfo?.state ?? "gone"}`,
+    );
+    srv1.kill("SIGTERM");
+    await waitExit(srv1, 15_000);
+    worker.kill("SIGKILL");
+    await rm(serveDir, { recursive: true, force: true }).catch(() => {});
   }
 
   // ── O4: legacy DB with a truly lost projection is rebuilt ────────────
@@ -1248,7 +1308,40 @@ async function phaseO(stateDir: string): Promise<void> {
       check("16 concurrent post-crash requests all 200 (shared readiness)", ok200 === 16, JSON.stringify(codes));
       const cli = await runCli(wstate, ["list"], { RAFTD_KEY: "e2ekey" });
       check("thin CLI works through published public port", cli.code === 0, cli.out.trim().slice(0, 80));
+      const portFile = (await readFile(path.join(wstate, "raftd.port"), "utf8")).trim();
+      const internalFile = (await readFile(path.join(wstate, "raftd.internal-port"), "utf8")).trim();
+      check(
+        "raftd.port names the PUBLIC entry; internal-port keeps the child",
+        portFile === `127.0.0.1:${pubPort}` && internalFile === `127.0.0.1:${childPort}`,
+        `port=${portFile} internal=${internalFile}`,
+      );
     }
+    // Hard refusal is an explicit 503, never a 500/502: a wrapper whose
+    // child can never spawn (NODE_BIN points nowhere → Popen throws inside
+    // _bring_up) must refuse cleanly.
+    const refusePort = await freePort();
+    const badState = await mkdtemp(path.join(tmpdir(), "raftd-e2e-badstate-"));
+    const wrapBad = spawn(PY, ["-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", String(refusePort)], {
+      cwd: path.join(REPO_ROOT, "deploy"),
+      env: {
+        ...process.env,
+        RAFTD_STATE: badState, RAFTD_DATA: await mkdtemp(path.join(tmpdir(), "raftd-e2e-baddata-")),
+        RAFTD_REPO: REPO_ROOT, RAFTD_CHILD_PORT: String(await freePort()),
+        PORT: String(refusePort), RAFTD_KEY: "e2ekey", NODE_BIN: "/nonexistent/raftd-node",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const badListening = await waitFor("broken wrapper listening", async () => {
+      const r = await fetch(`http://127.0.0.1:${refusePort}/healthz`).catch(() => null);
+      return r !== null; // any HTTP response = socket up (healthz 503s by design)
+    }, 60_000, 300);
+    const r503 = badListening
+      ? await fetch(`http://127.0.0.1:${refusePort}/api/state`, { headers: { authorization: "Bearer e2ekey" } }).then((r) => r.status).catch(() => -1)
+      : -1;
+    check("unspawnable child refuses with explicit 503", r503 === 503, `status=${r503}`);
+    wrapBad.kill("SIGTERM");
+    await waitExit(wrapBad, 15_000);
+    await rm(badState, { recursive: true, force: true }).catch(() => {});
     wrap.kill("SIGTERM");
     await waitExit(wrap, 15_000);
     await rm(wstate, { recursive: true, force: true }).catch(() => {});

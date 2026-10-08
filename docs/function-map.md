@@ -44,7 +44,7 @@
 | 21 | 启动失败熔断 | spawn-fail backoff / decision error window | **缺失** | 可对 err 计数入 cooldown |
 | 22 | 投递可见性账本 | agentVisibleDeliveryLedger：agent 到底"看见"了哪条消息 | **部分** | durable entry 天然可见性更强；显式账本缺失 |
 | 23 | machineLock 防双开 | 锁文件+token 防两个 daemon 抢一台机 | **已有** | `raftd.lock`（pid+token+内核启动时间原子锁）；serve 不可达时 CLI 拒开第二 Harness |
-| 24 | 孤儿进程回收 | daemonOrphanReaper SIGKILL 漏网子进程 | **不适用** | 没有子进程 |
+| 24 | 孤儿进程回收 | daemonOrphanReaper SIGKILL 漏网子进程 | **已有** | `tool-children.jsonl` 台账（pid+内核启动时间）；serve 拿锁后按进程组收割 |
 
 ## 三、运维面（跑在客户机器上要管什么）
 
