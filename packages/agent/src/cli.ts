@@ -88,7 +88,8 @@ function modelRef(spec: string | undefined): AgentModelRef | undefined {
   return { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) };
 }
 
-const DEFAULT_MODEL: AgentModelRef = { provider: "zai-coding-cn", modelId: "glm-5.3-flash" };
+// No built-in default model: the daemon picks one from whichever provider is
+// configured (see DurableDaemon.open → pickDefaultModel).
 
 async function main(): Promise<number> {
   const { positional, flags } = parseArgs(process.argv.slice(2));
@@ -108,12 +109,22 @@ async function main(): Promise<number> {
     const portFile = path.join(stateDir, "raftd.port");
     if (existsSync(portFile)) {
       const addr = (await readFile(portFile, "utf8")).trim();
-      const code = await runRemote(`http://${addr}`, cmd, positional, flags).catch(() => null);
-      if (code !== null) return code;
-      console.error(`error: a raftd serve was started on this state dir (port file ${portFile}) but is unreachable at http://${addr}.\n` +
-        "Refusing to open a second local Harness — SQLite is single-holder.\n" +
-        "Start `pnpm cli serve --state " + stateDir + "` again, or remove the stale raftd.port file only if no serve process is running.");
-      return 1;
+      try {
+        return await runRemote(`http://${addr}`, cmd, positional, flags);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Only a REAL connection failure means "serve is gone" — an HTTP
+        // error the serve returned must reach the user verbatim, not be
+        // disguised as an unreachable daemon (verified footgun).
+        if (!/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR|socket|network/i.test(msg)) {
+          console.error(`remote: ${msg}`);
+          return 1;
+        }
+        console.error(`error: a raftd serve was started on this state dir (port file ${portFile}) but is unreachable at http://${addr}.\n` +
+          "Refusing to open a second local Harness — SQLite is single-holder.\n" +
+          "Start `pnpm cli serve --state " + stateDir + "` again, or remove the stale raftd.port file only if no serve process is running.");
+        return 1;
+      }
     }
   }
 
@@ -126,7 +137,10 @@ async function main(): Promise<number> {
   const daemon = await DurableDaemon.open({
     stateDir,
     providers: "env",
-    defaultModel: modelRef(process.env.RAFTD_MODEL) ?? DEFAULT_MODEL,
+    // No hardcoded provider: RAFTD_MODEL wins; otherwise the daemon picks a
+    // model from whichever provider is actually configured (OpenAI-only users
+    // must not silently end up on the GLM default).
+    defaultModel: modelRef(process.env.RAFTD_MODEL),
     compactOnWakeMs: compactIdleMs,
     onWarn: (m) => console.error(`[warn] ${m}`),
   });
@@ -160,7 +174,7 @@ async function main(): Promise<number> {
         }
         const { record } = await daemon.createAgent({
           name,
-          model: modelRef(flags.model as string) ?? modelRef(process.env.RAFTD_MODEL) ?? DEFAULT_MODEL,
+          model: modelRef(flags.model as string) ?? modelRef(process.env.RAFTD_MODEL),
           instructions: flags.instructions as string | undefined,
           workspace: flags.workspace as string | undefined,
           thinkingLevel: flags.thinking as "minimal" | "low" | "medium" | "high" | undefined,
@@ -355,9 +369,13 @@ async function runRemote(
   flags: Record<string, string | boolean>,
 ): Promise<number> {
   const call = async (method: string, p: string, body?: unknown) => {
+    const key = String(process.env.RAFTD_KEY ?? "").trim();
     const r = await fetch(base + "/api/" + p, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(body !== undefined || p === "state" ? 30_000 : 120_000),
     });
@@ -373,6 +391,8 @@ async function runRemote(
       const rec: any = await call("POST", "agents", {
         name: positional[1], instructions: flags.instructions,
         ...(flags.model ? { model: flags.model } : {}),
+        ...(typeof flags.workspace === "string" ? { workspace: flags.workspace } : {}),
+        ...(flags.thinking ? { thinking: flags.thinking } : {}),
       });
       console.log(`created ${rec.agentId} (${rec.name})`);
       return 0;
@@ -418,7 +438,10 @@ async function runRemote(
     }
     case "outbox": console.log(JSON.stringify(await call("GET", `agents/${encodeURIComponent(id)}/outbox`), null, 2)); return 0;
     case "deliveries": {
-      const { deliveries }: any = await call("GET", `agents/${encodeURIComponent(id)}/deliveries?tail=200`);
+      const { deliveries }: any = await call(
+        "GET",
+        id ? `agents/${encodeURIComponent(id)}/deliveries?tail=200` : "deliveries?tail=200",
+      );
       for (const d of deliveries) console.log(JSON.stringify(d));
       return 0;
     }

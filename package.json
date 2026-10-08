@@ -8,5 +8,8 @@
     "e2e": "pnpm -C packages/agent e2e",
     "cli": "pnpm -C packages/agent cli",
     "raftd": "pnpm -C packages/agent raftd"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

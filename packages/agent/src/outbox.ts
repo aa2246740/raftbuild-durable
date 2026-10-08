@@ -23,7 +23,7 @@
  * instance to attribute gaps to — a drop is simply fail-closed → unreliable.
  */
 import { defineDocFamily } from "@earendil-works/pi-durable";
-import type { Harness } from "@earendil-works/pi-durable";
+import type { Harness, Tx } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import type { OutboxDocEntry, OutboxDocState, OutboxFrame } from "./types.ts";
 import type { OutboxTransport } from "./transport.ts";
@@ -164,6 +164,7 @@ export class AgentOutbox {
   async append(
     frame: OutboxFrame,
     dedupeKey?: string,
+    inTx?: (tx: Tx) => Promise<void>,
   ): Promise<{ clientSeq: number; result: OutboxAppendResult } | { duplicate: true }> {
     if (this.memoryUnreliable) {
       throw new OutboxError(`agent ${this.agentId} outbox is unreliable: ${this.memoryUnreliable}`, "unreliable");
@@ -174,7 +175,11 @@ export class AgentOutbox {
         if (doc.unreliable) {
           throw new OutboxError(`agent ${this.agentId} outbox is unreliable since ${doc.unreliable.since}`, "unreliable");
         }
-        return appendToOutboxDoc(doc, frame, dedupeKey);
+        const result = appendToOutboxDoc(doc, frame, dedupeKey);
+        // Atomic side-effects: callers can co-commit state (e.g. the registry
+        // projection) so a crash can't split "frame committed, state lost".
+        if (!("duplicate" in result)) await inTx?.(tx);
+        return result;
       }, this.ctx);
     } catch (err) {
       const benignClose = err instanceof Error && /session is closed/i.test(err.message);
@@ -192,6 +197,10 @@ export class AgentOutbox {
 
   /** Durable marker; retries its own commit until it lands (or the doc is unreadable). */
   async markUnreliable(cause: string): Promise<void> {
+    // Memory fail-closed FIRST: the same failure that broke the write usually
+    // breaks the marker commit too (sustained ENOSPC etc.). Only an explicit
+    // resolve() clears the agent — never a lucky next commit.
+    this.memoryUnreliable = cause;
     try {
       await this.harness.commit(async (tx) => {
         const doc = await tx.doc(OutboxDoc, this.agentId, this.agentId);
@@ -200,8 +209,7 @@ export class AgentOutbox {
         }
       }, this.ctx);
     } catch {
-      // Even the marker cannot be written; the agent stays unreliable in
-      // memory for this process — append() will keep failing to commit.
+      this.memoryUnreliable = `${cause} (unreliable-marker write also failed)`;
     }
     // Tell the consumer, best-effort, bypassing the outbox itself.
     try {

@@ -31,6 +31,7 @@ import {
   DurableDaemon,
   MachineLock,
   MachineLockError,
+  JsonlDeliveryTransport,
   OutboxDoc,
   OutboxError,
   ReminderService,
@@ -53,6 +54,17 @@ const REPORT = path.join(PKG_DIR, "e2e", "report.md");
 
 type Check = { phase: string; name: string; ok: boolean; detail: string };
 const checks: Check[] = [];
+
+// No model key → the run used to die 13 checks in and leave the PREVIOUS
+// green report.md standing. Stamp the report immediately, then bail.
+if (!(process.env.zhipu ?? process.env.ZAI_CODING_CN_API_KEY)) {
+  await mkdir(path.dirname(REPORT), { recursive: true });
+  await writeFile(REPORT, "# E2E report — raftbuild-durable\n\n**ABORTED**: no model API key (set zhipu or ZAI_CODING_CN_API_KEY).\n");
+  console.error("e2e needs a real model key (zhipu / ZAI_CODING_CN_API_KEY) — refusing to leave a stale report");
+  process.exit(1);
+}
+// The report is always this run's, not a stale leftover.
+await writeFile(REPORT, "# E2E report — raftbuild-durable\n\n(running…)\n");
 let currentPhase = "";
 function phase(name: string) {
   currentPhase = name;
@@ -64,6 +76,26 @@ function check(name: string, ok: boolean, detail = ""): boolean {
   return ok;
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Reserve a genuinely free port — a hardcoded port collides with orphans
+ * left by a previous crashed e2e run (verified: EADDRINUSE → silent dead srv). */
+async function freePort(): Promise<number> {
+  const { createServer } = await import("node:net");
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.listen(0, "127.0.0.1", () => {
+      const p = (s.address() as { port: number }).port;
+      s.close(() => resolve(p));
+    });
+    s.once("error", reject);
+  });
+}
+
+/** Wait for a child to exit without hanging when it already did. */
+async function waitExit(p: ReturnType<typeof spawn>, graceMs = 8_000): Promise<void> {
+  if (p.exitCode !== null || p.signalCode !== null) return;
+  await Promise.race([new Promise((r) => p.once("exit", r)), sleep(graceMs)]);
+}
 
 async function waitFor(desc: string, fn: () => Promise<boolean> | boolean, timeoutMs = 120_000, interval = 1_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
@@ -89,6 +121,16 @@ async function readDeliveries(stateDir: string, agentId: string): Promise<Outbox
 
 function transcriptFile(stateDir: string, agentId: string): string {
   return path.join(stateDir, "transcripts", `${agentId}.events.jsonl`);
+}
+
+async function transcriptCount(stateDir: string, agentId: string, needle: string): Promise<number> {
+  try {
+    return (await readFile(transcriptFile(stateDir, agentId), "utf8"))
+      .split("\n")
+      .filter((l) => l.includes(needle)).length;
+  } catch {
+    return 0;
+  }
 }
 
 async function transcriptHas(stateDir: string, agentId: string, needle: string): Promise<boolean> {
@@ -217,8 +259,10 @@ async function phaseC(stateDir: string, agentId: string) {
     return;
   }
 
-  // Wait until the turn is actually running (tool call visible), then kill -9.
-  const sawTool = await waitFor("tool call in transcript", () => transcriptHas(stateDir, agentId, '"kind":"tool_call"'), 60_000, 500);
+  // Wait until THIS turn's tool call is visible (count-relative — phase B
+  // already produced tool_call lines in the same transcript), then kill -9.
+  const toolCallsBefore = await transcriptCount(stateDir, agentId, '"kind":"tool_call"');
+  const sawTool = await waitFor("tool call in transcript", async () => (await transcriptCount(stateDir, agentId, '"kind":"tool_call"')) > toolCallsBefore, 60_000, 500);
   if (sawTool) await sleep(1_500);
   worker.kill("SIGKILL");
   const dead = await new Promise<boolean>((res) => worker.once("exit", () => res(true)));
@@ -231,7 +275,7 @@ async function phaseC(stateDir: string, agentId: string) {
   recover.stderr.on("data", (d) => (recOut += String(d)));
   const settled = await waitFor(
     "recovered daemon settles the submission",
-    () => /SETTLED \d+ status=/.test(recOut),
+    () => new RegExp(`SETTLED ${submissionId} status=done`).test(recOut),
     300_000,
     2_000,
   );
@@ -536,10 +580,10 @@ async function phaseI(stateDir: string, agentId: string) {
 
 // ── J: machine lock + serve HTTP + thin-CLI ─────────────────────────────────
 
-function runCli(stateDir: string, args: string[]): Promise<{ code: number | null; out: string }> {
+function runCli(stateDir: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
     const p = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), ...args], {
-      env: { ...process.env, RAFTD_STATE: stateDir },
+      env: { ...process.env, RAFTD_STATE: stateDir, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -688,6 +732,139 @@ async function phaseK(stateDir: string) {
 
 // ── L: hardening regressions (critic-driven fixes) ──────────────────────────
 
+// ── M: issue-#2 regression battery (local, no model calls) ────────────────
+
+async function phaseM(stateDir: string) {
+  phase("M — issue-#2 regressions");
+
+  // Lock: 32 concurrent acquires → exactly one winner, all others refused.
+  const race = await Promise.allSettled([...Array(32)].map(() => MachineLock.acquire(stateDir)));
+  const winners = race.filter((r) => r.status === "fulfilled");
+  const losers = race.filter((r) => r.status === "rejected" && r.reason instanceof MachineLockError);
+  check("32-way lock race: exactly one holder", winners.length === 1, `won=${winners.length} refused=${losers.length}`);
+  await (winners[0] as PromiseFulfilledResult<MachineLock> | undefined)?.value.release();
+
+  // Delivery-ledger dedupe: replayed (agentId, clientSeq) never written twice,
+  // even across transport instances (delivery-vs-ack crash window).
+  const dedupDir = path.join(stateDir, ".deliveries-dedupe");
+  await mkdir(dedupDir, { recursive: true });
+  const env = (seq: number): OutboxEnvelope => ({
+    agentId: "ledger-x",
+    clientSeq: seq,
+    attempt: 1,
+    frame: { type: "agent:runtime:outcome", agentId: "ledger-x", submissionId: "9" } as OutboxFrame,
+  });
+  const t1 = new JsonlDeliveryTransport(dedupDir);
+  await t1.send(env(2));
+  await t1.send(env(2));
+  const t2 = new JsonlDeliveryTransport(dedupDir);
+  await t2.send(env(2));
+  await t2.send(env(3));
+  const ledgerRaw = await readFile(path.join(dedupDir, "ledger-x.jsonl"), "utf8");
+  const seqs = ledgerRaw.trim().split("\n").map((l) => JSON.parse(l).clientSeq);
+  check("ledger dedupes replayed clientSeq", seqs.join(",") === "2,3", `seqs=${seqs.join(",")}`);
+
+  // parseWhen rejects out-of-range `at` (was silently rolling to another day).
+  let threw2599 = false;
+  try { parseWhen("at 25:99"); } catch { threw2599 = true; }
+  check("`at 25:99` rejected", threw2599);
+  check("`at 23:59` parses", parseWhen("at 23:59").dueAt.length > 0);
+
+  const daemon = await DurableDaemon.open({ stateDir, providers: "env", defaultModel: MODEL });
+  try {
+    // "main" is the operator inbox — reserved, not a creatable agent name.
+    let mainRefused = false;
+    try { await daemon.createAgent({ name: "main", model: MODEL }); } catch (err) { mainRefused = err instanceof AgentRegistryError; }
+    check('agent named "main" refused', mainRefused);
+
+    // Submission ownership: a foreign/unknown submission answers 404.
+    const { record } = await daemon.createAgent({ name: "mike", model: MODEL });
+    const owner = await daemon.submissionOwner("999999");
+    check("unknown submission has no owner", owner === undefined, String(owner));
+    void record;
+  } finally {
+    await daemon.close();
+  }
+
+  // HTTP validation + thin-CLI parity against a real serve.
+  const portA = await freePort();
+  const srv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portA)], {
+    env: { ...process.env, RAFTD_KEY: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let srvOut = "";
+  srv.stdout.on("data", (d) => (srvOut += String(d)));
+  srv.stderr.on("data", (d) => (srvOut += String(d)));
+  const up = await waitFor("serve up", async () => (await fetch(`http://127.0.0.1:${portA}/api/state`).catch(() => null))?.ok ?? false, 60_000, 500);
+  check("test serve up", up, srvOut.trim().slice(-120));
+  if (up) {
+    const post = (p: string, body: unknown) =>
+      fetch(`http://127.0.0.1:${portA}/api/${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    check("POST agents body=null → 400", (await post("agents", null)).status === 400);
+    check("POST agents name=123 → 400", (await post("agents", { name: 123 })).status === 400);
+    check('POST agents name="   " → 400', (await post("agents", { name: "   " })).status === 400);
+    check('POST agents name="main" → 400', (await post("agents", { name: "main" })).status === 400);
+    const nu = await post("agents", { name: "nova" });
+    check("POST agents valid → 201", nu.status === 201, `status=${nu.status}`);
+    const nova = (await nu.json()) as { agentId: string };
+    check("POST messages text=object → 400", (await post(`agents/${nova.agentId}/messages`, { text: { x: 1 } })).status === 400);
+    check("POST reminders when=at 25:99 → 400", (await post("reminders", { agent: "nova", when: "at 25:99", text: "x" })).status === 400);
+    check("GET answer foreign submission → 404", (await fetch(`http://127.0.0.1:${portA}/api/agents/${nova.agentId}/answer?submissionId=424242`)).status === 404);
+
+    // Thin-CLI parity (serve holds the state, CLI is remote).
+    const delAll = await runCli(stateDir, ["deliveries"], { RAFTD_KEY: "" });
+    check("remote deliveries w/o agent works", delAll.code === 0 && !delAll.out.includes("undefined"), delAll.out.trim().slice(0, 80));
+    const badSend = await runCli(stateDir, ["send", "ghost", "hi"], { RAFTD_KEY: "" });
+    check(
+      "remote HTTP error not disguised as unreachable",
+      badSend.code !== 0 && badSend.out.includes("remote") && !badSend.out.includes("Refusing"),
+      badSend.out.trim().slice(0, 120),
+    );
+    const mk = await runCli(stateDir, ["create", "remws", "--workspace", "wk-remote", "--thinking", "low"], { RAFTD_KEY: "" });
+    const sh = mk.code === 0 ? await runCli(stateDir, ["show", "remws"], { RAFTD_KEY: "" }) : { code: 1, out: mk.out };
+    check(
+      "remote create forwards --workspace/--thinking",
+      sh.code === 0 && sh.out.includes("wk-remote") && sh.out.includes('"thinkingLevel": "low"'),
+      sh.out.trim().replace(/\s+/g, " ").slice(0, 140),
+    );
+
+    srv.kill("SIGKILL");
+    await waitExit(srv);
+
+    // Bearer: keyed serve + thin CLI must authenticate.
+    const portB = await freePort();
+    const srv2 = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--port", String(portB)], {
+      env: { ...process.env, RAFTD_KEY: "k3y" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const up2 = await waitFor("keyed serve up", async () => (await fetch(`http://127.0.0.1:${portB}/api/state`, { headers: { authorization: "Bearer k3y" } }).catch(() => null))?.ok ?? false, 60_000, 500);
+    check("keyed serve up", up2);
+    if (up2) {
+      const noKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "" });
+      check("thin CLI without RAFTD_KEY → 401 surfaced", noKey.code !== 0 && /401|unauthorized|remote/i.test(noKey.out), noKey.out.trim().slice(0, 100));
+      const withKey = await runCli(stateDir, ["list"], { RAFTD_KEY: "k3y" });
+      check("thin CLI with RAFTD_KEY works", withKey.code === 0, withKey.out.trim().slice(0, 100));
+    }
+    srv2.kill("SIGKILL");
+    await waitExit(srv2);
+    await rm(path.join(stateDir, "raftd.port"), { force: true });
+  } else {
+    srv.kill("SIGKILL");
+  }
+
+  // Non-loopback without RAFTD_KEY refuses to start.
+  const refusedSrv = spawn("node", ["--experimental-transform-types", path.join(PKG_DIR, "src", "cli.ts"), "serve", "--state", stateDir, "--host", "0.0.0.0", "--port", String(await freePort())], {
+    env: { ...process.env, RAFTD_KEY: "", RAFTD_INSECURE: "" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let refOut = "";
+  refusedSrv.stdout.on("data", (d) => (refOut += String(d)));
+  refusedSrv.stderr.on("data", (d) => (refOut += String(d)));
+  const refCode = await Promise.race([
+    new Promise<number | null>((r) => refusedSrv.once("exit", (c) => r(c))),
+    sleep(20_000).then(() => -1),
+  ]);
+  if (refCode === -1) refusedSrv.kill("SIGKILL");
+  check("--host 0.0.0.0 without RAFTD_KEY refused", refCode !== 0 && refCode !== -1 && /refus/i.test(refOut), `code=${refCode} ${refOut.trim().slice(0, 100)}`);
+}
+
 async function phaseL(stateDir: string) {
   phase("L — hardening regressions");
 
@@ -777,6 +954,7 @@ try {
   await phaseJ(STATE_DIR, record.agentId);
   await phaseK(STATE_DIR);
   await phaseL(STATE_DIR);
+  await phaseM(STATE_DIR);
 } catch (err) {
   phaseAFail = true;
   check("real-model phases completed", false, err instanceof Error ? err.message : String(err));

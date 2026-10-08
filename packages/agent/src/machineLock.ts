@@ -11,7 +11,7 @@
  * - acquire is an atomic create (O_EXCL) — two racing serves cannot both win.
  */
 import { readFileSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -77,36 +77,48 @@ export class MachineLock {
   static async acquire(stateDir: string): Promise<MachineLock> {
     await mkdir(stateDir, { recursive: true });
     const file = path.join(stateDir, LOCK_NAME);
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const token = randomUUID();
-      const owner: LockOwner = {
-        pid: process.pid,
-        token,
-        startedAt: new Date().toISOString(),
-        pidStart: processStartTime(process.pid),
-      };
+    const token = randomUUID();
+    const owner: LockOwner = {
+      pid: process.pid,
+      token,
+      startedAt: new Date().toISOString(),
+      pidStart: processStartTime(process.pid),
+    };
+    const tmp = `${file}.tmp-${process.pid}-${token}`;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      // Atomic create-with-content: write the owner JSON to a private temp
+      // file, then hard-link it into place. link() fails EEXIST atomically —
+      // a reader NEVER sees a half-written lock, so an unreadable file can
+      // only be debris, not a concurrent writer mid-write (this used to be
+      // the race: writeFile('wx') creates the name before the JSON lands).
+      await writeFile(tmp, JSON.stringify(owner, null, 2) + "\n");
       try {
-        // O_EXCL: atomic create — two racing acquires cannot both succeed.
-        await writeFile(file, JSON.stringify(owner, null, 2) + "\n", { flag: "wx" });
+        await link(tmp, file);
         return new MachineLock(file, token);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        const existing = inspectLock(stateDir);
-        if (!existing) {
-          // Unreadable lock file → stale debris from a crash; take over.
-          await rm(file, { force: true });
-          continue;
-        }
-        if (existing.alive) {
-          throw new MachineLockError(
-            `state dir already locked by pid ${existing.owner.pid} (started ${existing.owner.startedAt})`,
-          );
-        }
-        // Dead or pid-reused foreign process → stale lock; take it over.
-        await rm(file, { force: true });
+      } finally {
+        await rm(tmp, { force: true });
+      }
+
+      const existing = inspectLock(stateDir);
+      if (existing?.alive) {
+        throw new MachineLockError(
+          `state dir already locked by pid ${existing.owner.pid} (started ${existing.owner.startedAt})`,
+        );
+      }
+      // Dead owner or debris → take over ATOMICALLY: rename() claims the
+      // slot, so two racing takeovers cannot both unlink a live successor's
+      // lock (rename fails ENOENT for the loser, who then retries link).
+      const stalePath = `${file}.stale-${token}`;
+      try {
+        await rename(file, stalePath);
+        await rm(stalePath, { force: true });
+      } catch {
+        // ENOENT → another racer claimed/recreated it; retry the link.
       }
     }
-    throw new MachineLockError(`could not acquire ${file} after 5 attempts (contention)`);
+    throw new MachineLockError(`could not acquire ${file} after 8 attempts (contention)`);
   }
 
   async release(): Promise<void> {

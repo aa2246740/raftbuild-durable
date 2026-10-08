@@ -9,7 +9,8 @@ Raft daemon 靠监管外部 CLI 进程做长驻会话；raftd 用
 
 ## 一分钟上手
 
-需要 **Node ≥ 22.7**（建议 24）+ **pnpm ≥ 10**（`corepack enable` 一次即可）。
+需要 **Node ≥ 24** + **pnpm ≥ 10**（`corepack enable` 一次即可）。
+（pi-durable 的 SQLite 存储用 `node:sqlite`，只有 Node 24+ 自带；Node 22.19+ 加 `--experimental-sqlite` 也能跑，但我们按 24 测试。）
 
 ```bash
 pnpm install
@@ -46,12 +47,15 @@ outbox——至少送达一次，`requestId` 去重保证恰好一次入库；�
 - **恰好一次**：outbox 先写后发、单在途、精确 ack、重传退避；路由帧带 `route:<agent>:<seq>` 幂等键
 - **溢出 fail-closed**：outbox 满 128 先丢最老 `turn_completed`，没得丢就标记 unreliable，人工 `resolve` 才恢复
 - **双开拒绝**：`raftd.lock`（pid+token）防止第二个 serve 抢 storage；CLI 自动降级成 HTTP 薄客户端
-- **工作区沙箱**：每个 agent 的工作目录被约束在 `workspaces/` 下一级
+- **工作区约定**（诚实说明：不是硬沙箱）：每个 agent 的工具默认在自己的 `workspaces/<agent>/` 目录里跑，创建 agent 时校验名字/路径不可逃逸；但 shell 工具按 cwd 执行，`cd ..` 之类的显式越界没有内核级隔离——别把它当安全边界，真正的边界是模型行为
 - **可打断**：`steer` 往运行中的轮次里插话；`whenBusy` = `steer`（插话）/ `followUp`（跑完此轮接着跑）/ `reject`（忙则拒绝）；不给=排队
 - **冷唤醒回收**：agent 静默超过阈值，下条消息先自动压缩上下文再跑——长驻不费 token
   （serve 默认 30m，`RAFTD_COMPACT_IDLE_MS=0` 关闭，e2e phase K 实测）
-- **联网安全**：`--host 0.0.0.0` 时必须设 `RAFTD_KEY`——之后所有 /api/* 要 Bearer 认证；
-  不设就打警告（控制台在 URL 上加 `?key=` 或在页面提示框里输）
+- **联网安全**：`--host` 绑公网地址时**必须**设 `RAFTD_KEY`——不设就拒绝启动
+  （`RAFTD_INSECURE=1` 显式放弃鉴权才会放它裸奔）。薄 CLI 读同一个 `RAFTD_KEY` 发 Bearer；
+  控制台在 URL 上加 `?key=` 或在页面提示框里输。名字 `main` 保留给操作员收件箱，不可创建。
+- **SIGKILL 时的工具子进程**（诚实说明）：daemon 被 `kill -9` 时，工具正在跑的子进程会成孤儿，
+  环境给不了进程组追踪——重开后事务内续跑是安全的，但那个孤儿可能自行跑完。删掉它：`pkill -f <命令>` 或重启前 `pnpm cli stop <agent>`
 
 ## 布局
 
@@ -88,7 +92,7 @@ serve HTTP+控制台+薄 CLI / 冷唤醒压缩 / 第三轮加固回归（活提�
   `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`——export 任一后重启 serve
   （启动时 0 个 provider 会直接打 warning）。
 - **状态在哪**：`--state` 指定目录（默认 `./.raftd`），备份=拷目录；删除=连目录一起 `rm -rf`。布局：
-  `session.sqlite`（会话+outbox+提醒 全 durable）、`workspaces/<agent>/`（沙箱工作区）、
+  `session.sqlite`（会话+outbox+提醒 全 durable）、`workspaces/<agent>/`（约定工作区）、
   `transcripts/<agent>.events.jsonl`（事件流水）、`.deliveries/`（送达账本，`pnpm cli deliveries`）、
   `raftd.lock`/`raftd.port`（单实例锁 / 薄客户端发现文件）。
 - **`<agent>` 参数**：名字和 agent-id 都行。

@@ -175,6 +175,9 @@ export type AgentRecord = {
   } | null;
   runs: number;
   failures: number;
+  /** Durable record of which submissions already projected their outcome into
+   * this record — makes the registry update idempotent across crash/repair. */
+  projectedSubmissions: string[];
 };
 
 export type AgentsDocState = {

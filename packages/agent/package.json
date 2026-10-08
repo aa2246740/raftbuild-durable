@@ -27,5 +27,8 @@
   },
   "bin": {
     "raftd": "src/cli.ts"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

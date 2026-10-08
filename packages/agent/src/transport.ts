@@ -6,7 +6,7 @@
  * with backoff, same identity). Consumers must dedupe by (agentId, clientSeq):
  * a frame may be sent more than once across retries/restarts.
  */
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { OutboxFrame } from "./types.ts";
 
@@ -30,10 +30,45 @@ export interface OutboxTransport {
  * what makes the e2e honest.
  */
 export class JsonlDeliveryTransport implements OutboxTransport {
+  /** (agentId → committed clientSeqs) — loaded from the ledger on first touch. */
+  private readonly seen = new Map<string, Set<number>>();
+
   constructor(private readonly dir: string) {}
+
+  /**
+   * The outbox can re-send a frame that was already committed here (crash
+   * between the ledger append and the outbox ack). The ledger is the
+   * "server" record: (agentId, clientSeq) must appear exactly once, so a
+   * repeat send is a successful no-op, not a second line.
+   */
+  private async committedSeqs(agentId: string): Promise<Set<number>> {
+    const cached = this.seen.get(agentId);
+    if (cached) return cached;
+    const seqs = new Set<number>();
+    this.seen.set(agentId, seqs);
+    try {
+      const raw = await readFile(path.join(this.dir, `${agentId}.jsonl`), "utf8");
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const rec = JSON.parse(line) as { clientSeq?: unknown };
+          if (typeof rec.clientSeq === "number") seqs.add(rec.clientSeq);
+        } catch {
+          /* tolerate a torn last line */
+        }
+      }
+    } catch {
+      /* no ledger yet */
+    }
+    return seqs;
+  }
 
   async send(envelope: OutboxEnvelope): Promise<void> {
     await mkdir(this.dir, { recursive: true });
+    const seqs = await this.committedSeqs(envelope.agentId);
+    // clientSeq <= 0 are out-of-band notices (e.g. unreliable markers), not
+    // outbox identities — always recorded; real entries dedupe.
+    if (envelope.clientSeq >= 1 && seqs.has(envelope.clientSeq)) return;
     const line = JSON.stringify({
       agentId: envelope.agentId,
       clientSeq: envelope.clientSeq,
@@ -42,6 +77,7 @@ export class JsonlDeliveryTransport implements OutboxTransport {
       frame: envelope.frame,
     });
     await appendFile(path.join(this.dir, `${envelope.agentId}.jsonl`), line + "\n", "utf8");
+    if (envelope.clientSeq >= 1) seqs.add(envelope.clientSeq);
   }
 }
 

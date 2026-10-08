@@ -7,7 +7,7 @@
  * "Daemon" here is a lifetime, not a process: `open()` on an existing state
  * dir IS the restart — unfinished work resumes via `harness.resume()`.
  */
-import { mkdir, appendFile, rm } from "node:fs/promises";
+import { mkdir, appendFile, rm, readdir, readlink, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -27,6 +27,7 @@ import {
   type Storage,
   type SubmissionId,
   type SubmissionRecord,
+  type Tx,
 } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
@@ -198,6 +199,11 @@ export class DurableDaemon {
     registry.install(RaftAgentExtension);
     registry.install(MessagingExtension);
 
+    const orphans = await reapOrphanedToolChildren(workspacesDir);
+    if (orphans > 0) {
+      console.error(`[daemon] reaped ${orphans} orphaned tool process(es) left by a previous host (SIGKILL window)`);
+    }
+
     const storage = await openNodeSqliteStorage(path.join(stateDir, "session.sqlite"));
     const harness = await Harness.open(
       storage,
@@ -214,6 +220,10 @@ export class DurableDaemon {
     );
 
     const transport = options.transport ?? new RoutingTransport(new JsonlDeliveryTransport(deliveriesDir));
+    const resolved = {
+      ...options,
+      defaultModel: options.defaultModel ?? pickDefaultModel(providers),
+    } as Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions;
     const daemon = new DurableDaemon(
       stateDir,
       workspacesDir,
@@ -223,7 +233,7 @@ export class DurableDaemon {
       harness,
       registry,
       transport,
-      options as Required<Pick<DurableDaemonOptions, "defaultModel">> & DurableDaemonOptions,
+      resolved,
       providers.length,
     );
     if (transport instanceof RoutingTransport) {
@@ -297,6 +307,11 @@ export class DurableDaemon {
     if (!model) {
       throw new Error("createAgent needs a model (or a daemon defaultModel)");
     }
+    // "main" is the routing target for the operator inbox — an agent by that
+    // name would never receive peer-routed messages.
+    if (config.name === "main") {
+      throw new AgentRegistryError('"main" is reserved for the operator inbox — pick another name', "invalid");
+    }
     const agentId = `agent-${randomUUID().slice(0, 8)}`;
     const workspaceName = config.workspace ?? agentId;
     const workspacePath = resolveWorkspaceDirectoryPath(this.workspacesDir, workspaceName);
@@ -351,6 +366,7 @@ export class DurableDaemon {
       lastOutcome: null,
       runs: 0,
       failures: 0,
+      projectedSubmissions: [],
     };
     try {
       await this.harness.commit(async (tx) => {
@@ -443,6 +459,9 @@ export class DurableDaemon {
         rec.updatedAt = new Date().toISOString();
       }
     }, BACKGROUND_CONTEXT);
+    // A started agent may have reminders whose fire failed while it was
+    // stopped — re-arm them now (resolveAgent delegates here too).
+    this.reminderHook?.();
   }
 
   /** Human outbox resolution — the daemon's admitted human start. */
@@ -537,6 +556,18 @@ export class DurableDaemon {
     if (!submission) throw new Error(`unknown submission: ${submissionId}`);
     const settled = await submission.wait(BACKGROUND_CONTEXT);
     return this.readAnswer(settled);
+  }
+
+  /** Which agent owns a submission (for API ownership checks); undefined = unknown. */
+  async submissionOwner(submissionId: string): Promise<string | undefined> {
+    const sub = await this.harness
+      .submission(Number(submissionId) as SubmissionId, BACKGROUND_CONTEXT)
+      .catch(() => undefined);
+    if (!sub) return undefined;
+    const rec = await sub.status(BACKGROUND_CONTEXT).catch(() => undefined);
+    if (!rec) return undefined;
+    const records = await this.listAgents();
+    return records.find((r) => r.conversationId === String(rec.conversationId))?.agentId;
   }
 
   /**
@@ -970,6 +1001,47 @@ export class DurableDaemon {
       };
     }
 
+    // Registry projection co-committed WITH the frame: one commit lands
+    // frame + dedupe key + lastOutcome/runs/terminalFailure, so a crash can
+    // never split "outcome delivered, projection lost". Pre-atomic states
+    // (a frame committed without projection) are repaired idempotently below.
+    const project = async (tx: Tx): Promise<void> => {
+      const doc = await tx.doc(AgentsDoc);
+      const record = doc.records[agentId];
+      if (!record) return;
+      record.projectedSubmissions ??= [];
+      if (record.projectedSubmissions.includes(settled.submissionId)) return;
+      record.projectedSubmissions.push(settled.submissionId);
+      if (record.projectedSubmissions.length > 4096) {
+        record.projectedSubmissions.splice(0, record.projectedSubmissions.length - 4096);
+      }
+      if (settled.status === "done") record.runs++;
+      else record.failures++;
+      // Only overwrite lastOutcome with a NEWER-or-equal submission — a
+      // late repair of an old submission must not clobber a newer one.
+      const cur = Number(record.lastOutcome?.submissionId ?? NaN);
+      const nxt = Number(settled.submissionId);
+      if (!record.lastOutcome || !Number.isFinite(cur) || !Number.isFinite(nxt) || nxt >= cur) {
+        record.lastOutcome = {
+          kind: outcome.kind,
+          status: settled.status,
+          submissionId: settled.submissionId,
+          reason: settled.status === "unanswered" ? (settled.reason ?? "unanswered") : null,
+          errorClass: outcome.kind === "terminal_failure" ? outcome.errorClass : null,
+          at: new Date().toISOString(),
+        };
+        if (outcome.kind === "terminal_failure" && outcome.errorAction !== null && outcome.errorAction !== "none") {
+          record.terminalFailure = {
+            failureKind: outcome.failureKind,
+            fingerprint: outcome.fingerprint,
+            detail: outcome.detail ?? settled.reason ?? "terminal failure",
+            at: new Date().toISOString(),
+          };
+        }
+      }
+      record.updatedAt = new Date().toISOString();
+    };
+
     const outbox = this.outboxFor(agentId);
     const appended = await outbox.append(
       {
@@ -979,34 +1051,15 @@ export class DurableDaemon {
         outcome,
       },
       settled.submissionId,
+      project,
     );
-    if ("duplicate" in appended) return;
+    if ("duplicate" in appended) {
+      // Frame already delivered (pre-atomic state may lack the projection):
+      // run the same idempotent update so a crash-lost projection repairs.
+      await this.harness.commit(project, BACKGROUND_CONTEXT).catch(() => {});
+      return;
+    }
     this.opts.onFrame?.(agentId, appended.clientSeq);
-
-    await this.harness.commit(async (tx) => {
-      const doc = await tx.doc(AgentsDoc);
-      const record = doc.records[agentId];
-      if (!record) return;
-      record.lastOutcome = {
-        kind: outcome.kind,
-        status: settled.status,
-        submissionId: settled.submissionId,
-        reason: settled.status === "unanswered" ? (settled.reason ?? "unanswered") : null,
-        errorClass: outcome.kind === "terminal_failure" ? outcome.errorClass : null,
-        at: new Date().toISOString(),
-      };
-      if (settled.status === "done") record.runs++;
-      else record.failures++;
-      record.updatedAt = new Date().toISOString();
-      if (outcome.kind === "terminal_failure" && outcome.errorAction !== null && outcome.errorAction !== "none") {
-        record.terminalFailure = {
-          failureKind: outcome.failureKind,
-          fingerprint: outcome.fingerprint,
-          detail: outcome.detail ?? settled.reason ?? "terminal failure",
-          at: new Date().toISOString(),
-        };
-      }
-    }, BACKGROUND_CONTEXT);
   }
 
   /**
@@ -1059,6 +1112,89 @@ function failureKindFor(reason: string | undefined): TerminalFailureKind {
   if (/input.*too.*large|context.*too.*long|InputTooLargeError/i.test(text)) return "compaction_input_too_large";
   if (/compaction/i.test(text)) return "compaction_failed";
   return "sticky_runtime_error";
+}
+
+/**
+ * Pick a default model from the actually-configured providers (issue: a
+ * hardcoded GLM default meant `export OPENAI_API_KEY` alone created agents
+ * that always answered no_model). Preference order first, then the first
+ * model in the first provider's catalog.
+ */
+function pickDefaultModel(providers: readonly Provider[]): AgentModelRef | undefined {
+  const preferred: Record<string, string> = {
+    "zai-coding-cn": "glm-5.3-flash",
+  };
+  for (const p of providers) {
+    const want = preferred[p.id];
+    if (!want) continue;
+    try {
+      if (p.getModels().some((m) => m.id === want)) {
+        return { provider: p.id, modelId: want };
+      }
+    } catch {
+      /* catalog unreadable */
+    }
+  }
+  for (const p of providers) {
+    try {
+      const first = p.getModels()[0];
+      if (first) return { provider: p.id, modelId: first.id };
+    } catch {
+      /* catalog unreadable */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Orphan reaper for the host-SIGKILL window: tool children run detached in
+ * their own process group under the agent's workspace, so when the host dies
+ * mid-tool they survive as orphans that can duplicate side effects while the
+ * durable run re-executes. On open, scan /proc for processes whose cwd is
+ * inside workspaces/ and SIGKILL their whole process group. POSIX only,
+ * best-effort — on non-Linux or restricted /proc this is a no-op.
+ */
+async function reapOrphanedToolChildren(workspacesDir: string): Promise<number> {
+  const proc = "/proc";
+  const root = path.resolve(workspacesDir);
+  let reaped = 0;
+  let ents: string[];
+  try {
+    ents = await readdir(proc);
+  } catch {
+    return 0;
+  }
+  // Own process group id (never kill ourselves even if we run inside workspaces/).
+  let ownPgid = -1;
+  try {
+    const self = await readFile("/proc/self/stat", "utf8");
+    ownPgid = Number(self.slice(self.lastIndexOf(")") + 2).split(" ")[2]);
+  } catch {
+    /* best-effort */
+  }
+  for (const pid of ents) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      const cwd = await readlink(path.join(proc, pid, "cwd"));
+      if (!cwd.startsWith(root + path.sep)) continue;
+      // After the last ')' of /proc/<pid>/stat the fields are
+      // `state ppid pgrp …` — pgrp is index 2.
+      const stat = await readFile(path.join(proc, pid, "stat"), "utf8");
+      const afterComm = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const pgid = Number(afterComm[2]);
+      if (Number.isInteger(pgid) && pgid > 0 && pgid !== ownPgid) {
+        try {
+          process.kill(-pgid, "SIGKILL");
+          reaped++;
+        } catch {
+          /* group gone */
+        }
+      }
+    } catch {
+      /* process exited or no permission */
+    }
+  }
+  return reaped;
 }
 
 async function detectEnvProviders(): Promise<Provider[]> {

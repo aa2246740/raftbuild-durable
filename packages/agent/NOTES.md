@@ -105,3 +105,24 @@ durable systemNotice（"Host restarted — resuming N unfinished submission(s)"�
 
 上游示例全集在 pi 仓库 `packages/durable/test/examples/`（00–31，见 earendil-works/pi
 GitHub 仓库）；本仓库内可直接跑 `pnpm example:recovery`（examples/13-recovery.ts）。
+（GitHub issue #2 评审修复）
+
+| 发现 | 修法 |
+|---|---|
+| MachineLock 并发/接管双竞态 | tmp 文件 + `link()` 原子创建（读者永远看不到半写锁）；接管 `rename()` 原子认领后删 |
+| `markUnreliable` 持久化失败丢内存标 | 先置 `memoryUnreliable`，只有显式 `resolve` 能清 |
+| 送达账本 (agentId,clientSeq) 可重复 | `JsonlDeliveryTransport` 启动回放 ledger 建 seq 集合，重复 clientSeq 直接跳过 |
+| outcome 提交与 registry 投影可被崩溃拆开 | `outbox.append(frame, key, inTx)` —— 帧+幂等键+AgentsDoc 投影一个事务落；重复路径幂等修复 |
+| SIGKILL 后工具孤儿进程残留 | `open()` 时扫 `/proc`：cwd 在 workspaces/ 下的进程按 pgid 整组 SIGKILL（Linux 尽力而为）；文档不再说 "no child processes" |
+| "workspace 沙箱" 名不副实 | 文档改口：cwd 约定非硬隔离 |
+| 非 loopback 无 RAFTD_KEY 只警告 | 拒绝启动；`RAFTD_INSECURE=1` 显式裸奔；薄 CLI 自动带 Bearer |
+| `main` 可被创建但收不到路由 | createAgent 拒绝该名（保留给 operator inbox） |
+| answer 路由不验归属 | 先 404 解析 agent，再校验 submission ∈ 其 conversation |
+| 默认模型写死 GLM | `pickDefaultModel(providers)` 按已配置 provider 选 |
+| Node ≥22.7 声明错误 | README/`engines` 改 ≥24（`node:sqlite`） |
+| HTTP 校验一堆洞 | body 非 object→400、name/text/when 类型+非空→400、busy reject→409、`at 25:99`→400 |
+| 提醒投递失败丢定时器 | fire 失败 → +60s 重布防；startAgent/resolveAgent 触发 resync |
+| 薄 CLI remote 不一致 | create 转发 workspace/thinking；`deliveries` 无参走 `/api/deliveries`；HTTP 错误原文上抛不伪装 unreachable |
+| 控制台发送失败清输入 | 成功才清空；错误横幅提示；390px 窄屏纵向布局 |
+| IPv6 `--host ::1` | URL/端口文件都带 `[]` |
+| 云包装层 | 认证化就绪探测、`?key=`→Bearer 注入、child 死后按需重生+503 healthz、SIGTERM 收 child、`/setup/env` 全 provider+merge 不重写 |

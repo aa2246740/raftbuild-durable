@@ -5,7 +5,7 @@
  * UI: the console is a single HTML file served from memory.
  */
 import { createServer, type IncomingMessage as HttpRequest, type Server, type ServerResponse } from "node:http";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile, rm, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -36,6 +36,9 @@ function statusFor(err: unknown): number {
     return 400;
   }
   if (err instanceof OutboxError) return 409; // unreliable/overflow → conflict state
+  if (err instanceof Error && /conversation is busy|cannot parse when|invalid (hour|minute)|repeating reminders/i.test(err.message)) {
+    return /busy/i.test(err.message) ? 409 : 400;
+  }
   return 500;
 }
 
@@ -50,11 +53,27 @@ async function readBody(req: HttpRequest): Promise<unknown> {
   for await (const c of req) chunks.push(c as Buffer);
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw) return {};
+  let parsed: unknown;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     throw new HttpError(400, "request body is not valid JSON");
   }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new HttpError(400, "request body must be a JSON object");
+  }
+  return parsed;
+}
+
+/** Non-empty trimmed string field, or a 400. */
+function reqString(v: unknown, field: string): string {
+  if (typeof v !== "string" || !v.trim()) throw new HttpError(400, `${field} must be a non-empty string`);
+  return v;
+}
+function optString(v: unknown, field: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string") throw new HttpError(400, `${field} must be a string`);
+  return v;
 }
 
 /** Read the last `n` parsed events of an agent's transcript JSONL. */
@@ -80,16 +99,24 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
   // RAFTD_KEY gates every /api/* call (the console stores it in localStorage).
   const apiKey = String(process.env.RAFTD_KEY ?? "").trim() || undefined;
-  if (!loopback && !apiKey) {
-    console.error(
-      `warning: listening on ${host} without RAFTD_KEY — anyone on the network can create agents, send messages and read transcripts. Set RAFTD_KEY or bind to 127.0.0.1.`,
+  // A public listener without an admin key hands strangers the ability to
+  // create agents and run tool calls — refuse unless explicitly opted out.
+  if (!loopback && !apiKey && process.env.RAFTD_INSECURE !== "1") {
+    throw new Error(
+      `refusing to bind ${host}: RAFTD_KEY is not set. Set RAFTD_KEY=<key> (clients send Bearer <key>), ` +
+        `bind 127.0.0.1, or set RAFTD_INSECURE=1 to run unauthenticated on purpose.`,
     );
   }
+  if (!loopback && !apiKey) {
+    console.error(`warning: RAFTD_INSECURE=1 — ${host} listener is unauthenticated; anyone on the network controls agents.`);
+  }
 
+  // Bracket IPv6 literals — `http://::1:4777` is not a valid base URL.
+  const base = host.includes(":") ? `http://[${host}]:${port}` : `http://${host}:${port}`;
   const server = createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://${host}:${port}`);
-    const parts = url.pathname.split("/").filter(Boolean);
     try {
+      const url = new URL(req.url ?? "/", base);
+      const parts = url.pathname.split("/").filter(Boolean);
       // ── console ──
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -131,14 +158,23 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
 
       if (parts[1] === "agents") {
         if (req.method === "POST" && parts.length === 2) {
-          const body = (await readBody(req)) as { name?: string; instructions?: string; model?: string };
-          if (!body.name) return json(res, 400, { error: "name required" });
-          const model = body.model
-            ? { provider: body.model.split("/")[0] ?? "", modelId: body.model.split("/").slice(1).join("/") }
+          const body = (await readBody(req)) as {
+            name?: unknown; instructions?: unknown; model?: unknown;
+            workspace?: unknown; thinking?: unknown;
+          };
+          const name = reqString(body.name, "name");
+          const instructions = optString(body.instructions, "instructions");
+          const workspace = optString(body.workspace, "workspace");
+          const thinking = optString(body.thinking, "thinking");
+          const modelSpec = optString(body.model, "model");
+          const model = modelSpec
+            ? { provider: modelSpec.split("/")[0] ?? "", modelId: modelSpec.split("/").slice(1).join("/") }
             : undefined;
           const created = await daemon.createAgent({
-            name: body.name,
-            instructions: body.instructions,
+            name,
+            instructions,
+            workspace,
+            thinkingLevel: thinking as "minimal" | "low" | "medium" | "high" | undefined,
             ...(model?.modelId ? { model } : {}),
           });
           json(res, 201, created.record);
@@ -153,11 +189,14 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
               requestId?: string;
               raw?: boolean;
             };
-            if (!body.text) return json(res, 400, { error: "text required" });
+            const text = reqString(body.text, "text");
             if (body.whenBusy !== undefined && !["steer", "followUp", "reject"].includes(body.whenBusy)) {
               return json(res, 400, { error: `whenBusy must be steer|followUp|reject (got "${body.whenBusy}")` });
             }
-            const r = await daemon.postMessage(id, body.text, {
+            if (body.requestId !== undefined && typeof body.requestId !== "string") {
+              return json(res, 400, { error: "requestId must be a string" });
+            }
+            const r = await daemon.postMessage(id, text, {
               whenBusy: body.whenBusy,
               requestId: body.requestId,
               raw: body.raw === true,
@@ -183,8 +222,15 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
             return;
           }
           if (req.method === "GET" && parts[3] === "answer") {
+            const record = await daemon.getAgent(id); // 404 for unknown agent
             const sid = url.searchParams.get("submissionId");
             if (!sid) return json(res, 400, { error: "submissionId required" });
+            // A submission answer may only be read through its own agent's
+            // route — anything else is a 404, not a leak of another agent's.
+            const owner = await daemon.submissionOwner(sid);
+            if (owner !== record.agentId) {
+              return json(res, 404, { error: `submission ${sid} not found for ${record.agentId}` });
+            }
             // Server-side ceiling below the thin-CLI's 120s fetch timeout so a
             // hung answer resolves as a real 504 instead of an aborted socket.
             const timeoutMs = Math.min(Math.max(Number(url.searchParams.get("timeout") ?? "110"), 1), 300) * 1000;
@@ -228,11 +274,26 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
         }
       }
 
+      // Every agent's delivery ledgers, flattened (thin-CLI `deliveries` w/o args).
+      if (req.method === "GET" && parts[1] === "deliveries") {
+        const tail = Math.min(Number(url.searchParams.get("tail") ?? "200") || 200, 500);
+        const files = await readdir(daemon.deliveriesDir).catch(() => [] as string[]);
+        const all: unknown[] = [];
+        for (const f of files.filter((f) => f.endsWith(".jsonl"))) {
+          all.push(...(await transcriptTail(path.join(daemon.deliveriesDir, f), tail)));
+        }
+        json(res, 200, { deliveries: all });
+        return;
+      }
+
       if (parts[1] === "reminders") {
         if (req.method === "POST" && parts.length === 2) {
-          const body = (await readBody(req)) as { agent?: string; when?: string; text?: string };
-          if (!body.agent || !body.when || !body.text) return json(res, 400, { error: "agent, when, text required" });
-          json(res, 201, await daemon.remind(body.agent, body.when, body.text));
+          const body = (await readBody(req)) as { agent?: unknown; when?: unknown; text?: unknown };
+          json(
+            res,
+            201,
+            await daemon.remind(reqString(body.agent, "agent"), reqString(body.when, "when"), reqString(body.text, "text")),
+          );
           return;
         }
         if (req.method === "DELETE" && parts.length === 3) {
@@ -255,7 +316,7 @@ export async function startServer(daemon: DurableDaemon, opts: ServeOptions = {}
   // Port file: local CLI commands discover the live host instead of opening
   // the storage themselves (one Harness per storage — never two).
   const portFile = path.join(daemon.stateDir, "raftd.port");
-  await writeFile(portFile, `${host}:${port}`, "utf8");
+  await writeFile(portFile, host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`, "utf8");
   server.once("close", () => void rm(portFile, { force: true }).catch(() => {}));
   return server;
 }
