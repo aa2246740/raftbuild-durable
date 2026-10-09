@@ -1,6 +1,6 @@
 {
   "name": "raftbuild-durable",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@10.20.0",
   "scripts": {
