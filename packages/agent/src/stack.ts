@@ -83,6 +83,27 @@ function aliveProcNames(pid: number): string {
   }
 }
 
+function tcpBound(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.connect(port, "127.0.0.1");
+    s.once("connect", () => {
+      s.destroy();
+      resolve(true);
+    });
+    s.once("error", () => {
+      s.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/** PID of the process actually listening on `port` (via ss), or null. */
+function listenerPid(port: number): number | null {
+  const out = spawnSync("ss", ["-tlnpH", `sport = :${port}`], { encoding: "utf8" });
+  const m = /pid=(\d+)/.exec(out.stdout ?? "");
+  return m ? Number(m[1]) : null;
+}
+
 function tcpReady(port: number, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
@@ -167,13 +188,25 @@ async function stackStart(stateDir: string, flags: Record<string, unknown>): Pro
   const redisUrl = `redis://127.0.0.1:${ports.redis}`;
   const jwtSecret = String(flags["jwt-secret"] ?? `dev-${process.env.USER ?? "stack"}-${path.basename(stateDir)}`);
 
+  // Refuse to silently adopt orphans: if a port is already bound and the
+  // listener isn't one of our recorded pids, bail — adopting a foreign
+  // listener makes `stop` miss the process actually holding the port.
+  const known = new Set(Object.values(existing?.pids ?? {}).filter(Boolean));
+  for (const [label, port] of Object.entries({ redis: ports.redis, server: ports.server, web: ports.web })) {
+    const bound = await tcpBound(port);
+    const owner = bound ? listenerPid(port) : null;
+    if (bound && !(owner && known.has(owner))) {
+      throw new Error(`port ${port} (${label}) already bound${owner ? ` by pid ${owner}` : ""} — free it or run \`raftd stack stop\` on the owning state dir`);
+    }
+  }
+
   // 1. redis — real binary (PATH or vendored), persistence off (pub/sub only)
   const redis = resolveRedis();
   if (!redis) {
     throw new Error("redis-server not found on PATH and no vendored copy at upstream/vendor/redis — install redis-server or set RAFTD_REDIS_SERVER");
   }
   const pids: StackState["pids"] = {};
-  pids.redis = spawnLogged("redis", redis.bin, [
+  const redisSpawn = spawnLogged("redis", redis.bin, [
     "--port", String(ports.redis),
     "--bind", "127.0.0.1",
     "--dir", path.join(dir, "redis"),
@@ -182,6 +215,13 @@ async function stackStart(stateDir: string, flags: Record<string, unknown>): Pro
     "--daemonize", "no",
   ], { cwd: dir, env: redis.env, logDir: logs });
   await tcpReady(ports.redis, 15_000);
+  // Record the real listener pid — wrappers can exec into a child, and a
+  // crashed prior run may have left an orphan holding the port. `stop` must
+  // reach the listener, not a dead spawn handle.
+  pids.redis = listenerPid(ports.redis) ?? redisSpawn;
+  if (!pidAlive(redisSpawn) && !pidAlive(pids.redis)) {
+    throw new Error(`redis spawn died and no listener on :${ports.redis} — see ${path.join(logs, "redis.log")}`);
+  }
   console.error(`[stack] redis :${ports.redis} (pid ${pids.redis})`);
 
   // 2. seed once — the patched seed script runs migratePglite itself, then
@@ -218,7 +258,7 @@ async function stackStart(stateDir: string, flags: Record<string, unknown>): Pro
   };
   // keep object storage on local disk — any inherited S3_* would flip the backend
   for (const k of Object.keys(serverEnv)) if (k.startsWith("S3_")) delete serverEnv[k];
-  pids.server = spawnLogged("server", process.execPath, [
+  const serverSpawn = spawnLogged("server", process.execPath, [
     "--import", "@oxc-node/core/register", "src/server.ts",
   ], { cwd: SERVER_PKG, env: serverEnv, logDir: logs });
   // server "ready" = login endpoint answers (404 on /healthz is expected — it doesn't exist)
@@ -228,15 +268,17 @@ async function stackStart(stateDir: string, flags: Record<string, unknown>): Pro
       throw new Error(`server never listened — see ${path.join(logs, "server.log")}`);
     });
   });
+  pids.server = listenerPid(ports.server) ?? serverSpawn;
   console.error(`[stack] server :${ports.server} (pid ${pids.server}, pglite)`);
 
   // 4. web — vite dev server proxying /api /internal /socket.io /daemon to the server
-  pids.web = spawnLogged("web", "pnpm", ["exec", "vite", "--port", String(ports.web), "--strictPort"], {
+  const webSpawn = spawnLogged("web", "pnpm", ["exec", "vite", "--port", String(ports.web), "--strictPort"], {
     cwd: WEB_PKG,
     env: { ...process.env, SLOCK_SERVER_PORT: String(ports.server), VITE_DEV_PORT: String(ports.web) },
     logDir: logs,
   });
   await httpReady(`http://localhost:${ports.web}/`, 60_000);
+  pids.web = listenerPid(ports.web) ?? webSpawn;
   console.error(`[stack] web :${ports.web} (pid ${pids.web})`);
 
   const state: StackState = { ports, pids, startedAt: new Date().toISOString() };
