@@ -10,11 +10,14 @@
  * Outputs JSON with credentials to stdout (or --output file).
  */
 import { drizzle } from "drizzle-orm/node-postgres";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import argon2 from "argon2";
 import * as schema from "../src/db/schema";
+import { migratePglite } from "../src/db/pgliteMigrations";
 import { buildSearchText } from "../src/services/searchService";
 import { getStorage } from "../src/services/storageService";
 import { applyDevSeedOnboardingFixture } from "./devSeedOnboarding";
@@ -111,8 +114,19 @@ async function main() {
     }
   }
 
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 5 });
-  const db = drizzle(pool, { schema });
+  // pglite:// URLs use the embedded driver (same convention as src/db/index.ts):
+  // `pglite://` (or :memory:) is transient, `pglite://<dir>` persists to that dir.
+  const isPglite = databaseUrl.startsWith("pglite://");
+  const pgliteDir = isPglite
+    ? databaseUrl.slice("pglite://".length).trim() || undefined
+    : undefined;
+  const pool = isPglite ? null : new pg.Pool({ connectionString: databaseUrl, max: 5 });
+  const pglite = isPglite ? new PGlite(pgliteDir) : null;
+  const db = isPglite
+    ? (drizzlePglite(pglite!, { schema }) as unknown as ReturnType<typeof drizzle>)
+    : drizzle(pool!, { schema });
+  // Embedded mode has no server to migrate first — run pending migrations here.
+  if (pglite) await migratePglite(pglite);
 
   try {
     // 1. User
@@ -2479,7 +2493,8 @@ async function main() {
       console.log(json);
     }
   } finally {
-    await pool.end();
+    await pool?.end();
+    await pglite?.close();
   }
 }
 

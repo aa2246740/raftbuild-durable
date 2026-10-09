@@ -25,6 +25,7 @@ import { DurableDaemon } from "./daemon.ts";
 import { MachineLock } from "./machineLock.ts";
 import { parseWhen, ReminderService } from "./reminders.ts";
 import { startServer } from "./serve.ts";
+import { runStack } from "./stack.ts";
 import { readApiKey } from "./auth.ts";
 import { buildBoundedVisibleCrashDetail } from "./diagnostics.ts";
 import { parseArgs, RemoteApiError, timeoutFrom, waitForRemoteAnswer } from "./cliSupport.ts";
@@ -55,6 +56,7 @@ const USAGE = `raftd — durable agent daemon (pi-durable)
   delete <agent> [--workspace]
   usage [agent] | inspect
   serve [--port N] [--host H]                         daemon loop + web console (default :4777)
+  stack [start|stop|status]                           embedded upstream platform (pglite+redis+vite web)
 
 --state <dir> or RAFTD_STATE (default ./.raftd); --model or RAFTD_MODEL.
 Send without serve only queues work. Start serve to execute it.
@@ -92,6 +94,12 @@ async function main(): Promise<number> {
   if (cmd === "wait" && !/^\d+$/.test(positional[2] ?? "")) throw new Error("wait requires a numeric <submissionId>");
   if (cmd === "remind" && (!positional[2] || !positional.slice(3).join(" ").trim())) throw new Error("remind requires <agent> <when> <text>");
   const stateDir = (flags.state as string) ?? process.env.RAFTD_STATE ?? ".raftd";
+
+  // `stack` orchestrates the vendored upstream platform — its own state dir,
+  // no raftd storage lock, no thin-client hop.
+  if (cmd === "stack") {
+    return await runStack(positional[1], flags, stateDir);
+  }
 
   // If `raftd serve` was here (port file), act as a thin client — opening the
   // storage anyway would mean two Harnesses on one SQLite. When the serve
