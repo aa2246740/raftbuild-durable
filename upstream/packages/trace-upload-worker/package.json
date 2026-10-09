@@ -1,0 +1,26 @@
+{
+  "name": "@botiverse/raft-trace-upload-worker",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "node --watch --import @oxc-node/core/register src/node.ts",
+    "start": "node --import @oxc-node/core/register src/node.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "reingest": "node --import @oxc-node/core/register src/reingest.ts"
+  },
+  "dependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "scopedb": "0.2.2"
+  },
+  "devDependencies": {
+    "@botiverse/raft-trace-client": "workspace:*",
+    "@oxc-node/core": "^0.1.3",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.2"
+  }
+}

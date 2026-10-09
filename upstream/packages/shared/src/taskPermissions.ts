@@ -1,0 +1,41 @@
+import type { ServerRole } from "./serverPermissions";
+
+export const TASK_ACTIONS = [
+  "read",
+  "create",
+  "convert",
+  "claim",
+  "unclaim",
+  "assign",
+  "change_status",
+  "delete",
+] as const;
+
+export type TaskAction = typeof TASK_ACTIONS[number];
+
+export type TaskReadOnlyReason = "historical_joint_task";
+
+export interface TaskAuthorizationInput {
+  action: TaskAction;
+  serverRole: ServerRole | null | undefined;
+  canReadChannel: boolean;
+  canWriteChannel: boolean;
+  isCreator?: boolean;
+  isAssignee?: boolean;
+  hasAssignTasks?: boolean;
+  hasDeleteAnyTask?: boolean;
+  /** Resource authority projected by the server, separate from actor role. */
+  readOnlyReason?: TaskReadOnlyReason | null;
+}
+
+/**
+ * Typed task policy. Channel authority is necessary but never sufficient for
+ * mutation: Guest is read-only even after joining a writable channel.
+ */
+export function authorizeTaskAction(input: TaskAuthorizationInput): boolean {
+  if (input.action === "read") return input.canReadChannel;
+  // This is the channel/admission gate, not a replacement for each route's
+  // existing relationship/capability policy. Non-Guest mutations continue to
+  // reach taskService and the route-specific assignee/assign/delete checks.
+  return input.readOnlyReason == null && input.serverRole !== "guest" && input.canWriteChannel;
+}
